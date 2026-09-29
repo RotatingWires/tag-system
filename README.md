@@ -114,7 +114,7 @@ The server exposes HTTP endpoints for tag creation/retrieval, search, deletion, 
 
 The CLI converts commands such as `tag add` or `tag show` into HTTP requests to the server. For `get`, it can combine text/URL/file contents into clipboard-friendly output. File items are downloaded from the server's `/download/...` endpoint.
 
-Deleting a tag removes its database entry; the current server does **not** automatically remove cached files that belonged to that tag.
+Deleting a tag removes its database entry and also deletes uploaded files for that tag when those files are still present on disk.
 
 ## Security
 
