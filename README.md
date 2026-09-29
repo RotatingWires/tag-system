@@ -1,3 +1,6 @@
+> [!WARNING]
+> This project is fully vibecoded, probably inefficient, but it does what I wanted lol
+
 # Tag System
 
 A small self-hosted tagging service for saving **text, URLs, and files** under simple tag names and retrieving them from a command-line client. It is designed for a personal LAN/VPN workflow: a FastAPI server runs on one machine (for example a NAS), while the `tag` client can run on Linux or another computer and talk to that server over HTTP.
@@ -125,7 +128,3 @@ This is a lightweight personal tool, not a hardened internet-facing service. Imp
 - Restrict the firewall so port `8710` is not open to the public internet unless you intentionally add proper TLS/reverse-proxy/access controls.
 - `tags.json` and `tag-cache/` can contain private material and are ignored by Git. Back them up separately if needed.
 - Uploaded filenames are handled by the server and stored on disk; only run this service for users you trust.
-
-## Git / local data
-
-The repository intentionally excludes runtime data, virtual environments, secrets, and cache files through `.gitignore`. Keep your real `API_KEY`, `tags.json`, and `tag-cache/` out of source control.
