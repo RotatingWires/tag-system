@@ -7,13 +7,13 @@ A small self-hosted tagging service for saving **text, URLs, and files** under s
 
 ## What it does
 
-A tag can contain multiple items. Items can be plain text, URLs, or uploaded files. The client can add items, list tags, show one tag, search all tags, delete a tag, copy retrieved data to the clipboard, download files, and optionally open downloaded files.
+A tag can contain multiple items. Items can be plain text, URLs, or uploaded files. The client can add items, list tags, show one tag, show all tags, search tag names, delete a tag, retrieve tag contents to the clipboard, download stored files, and optionally open downloaded files.
 
 Project layout:
 
 ```text
 server/tag-server.py   FastAPI server and JSON/file storage
-client/tag             Command-line client
+client/tag             command-line client
 requirements.txt       Python dependencies
 ```
 
@@ -35,16 +35,18 @@ Client:
 Install the Python dependencies:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
-On Fedora, the optional clipboard helper can be installed with:
+A virtual environment is optional; the project does not require one.
+
+On Fedora, the clipboard helper can be installed with:
 
 ```bash
 sudo dnf install xclip
 ```
+
+`xdg-open` is normally provided by the desktop environment / `xdg-utils` package.
 
 ## Server setup
 
@@ -69,7 +71,7 @@ cd server
 uvicorn tag-server:app --host 0.0.0.0 --port 8710
 ```
 
-If your Uvicorn version dislikes the hyphen in `tag-server.py`, rename it to `tag_server.py` and run:
+If your Uvicorn/Python import setup dislikes the hyphen in `tag-server.py`, rename it to `tag_server.py` and run:
 
 ```bash
 uvicorn tag_server:app --host 0.0.0.0 --port 8710
@@ -94,7 +96,7 @@ mkdir -p ~/bin
 cp client/tag ~/bin/tag
 ```
 
-## Example commands
+## Commands
 
 ```bash
 tag add notes --text "remember this"
@@ -109,22 +111,113 @@ tag search router
 tag delete old-tag
 ```
 
-Multiple `--text`, `--url`, and `--file` values can be supplied to one `add` command.
+### `tag add NAME`
+
+Add one or more items to a tag. `--text`, `--url`, and `--file` are repeatable, so one command can append several items without replacing items already stored under that tag.
+
+Examples:
+
+```bash
+tag add links --url "https://example.com/a" --url "https://example.com/b"
+tag add mixed --text "hello" --url "https://example.com" --file ./photo.png
+```
+
+### `tag show NAME`
+
+Print the items stored under one tag. File entries show their filename and the server-side Windows path recorded in `tags.json`.
+
+### `tag show-all`
+
+Print every tag and its items.
+
+### `tag get NAME`
+
+Retrieve the tag and copy a text representation to the Linux clipboard with `xclip`.
+
+For text and URL items, the actual text/URL is copied.
+
+For file items, the client downloads the file into the local temporary directory. The clipboard text includes the downloaded path. If the downloaded file is UTF-8-readable text, its text contents are appended too. Binary file bytes are **not** placed on the clipboard as a native file object by the current client; binary entries are represented by their downloaded path plus a note that their contents are not displayed.
+
+Use:
+
+```bash
+tag get NAME --open-files
+```
+
+to also open each downloaded file with `xdg-open`.
+
+### `tag list`
+
+Print tag names only.
+
+### `tag search QUERY`
+
+Search tag **names** case-insensitively. This does not currently full-text-search the contents of saved text/files.
+
+### `tag delete NAME`
+
+Delete the tag's database entry. Uploaded files belonging to that tag are also removed from `tag-cache` when they are still present on disk.
 
 ## How it works
 
 The server exposes HTTP endpoints for tag creation/retrieval, search, deletion, and file downloads. Every request must include the configured `x-api-key` header. Metadata is stored in a JSON database; uploaded files are copied into `tag-cache/`.
 
-The CLI converts commands such as `tag add` or `tag show` into HTTP requests to the server. For `get`, it can combine text/URL/file contents into clipboard-friendly output. File items are downloaded from the server's `/download/...` endpoint.
+Main endpoints:
 
-Deleting a tag removes its database entry and also deletes uploaded files for that tag when those files are still present on disk.
+```text
+GET    /tags
+GET    /tags/{tag_name}
+POST   /tags/{tag_name}/add
+DELETE /tags/{tag_name}
+GET    /tags/search/{query}
+GET    /download/{tag_name}/{filename}
+```
+
+The CLI converts commands such as `tag add` or `tag show` into HTTP requests to the server. File items are downloaded from the server's `/download/...` endpoint when `tag get` needs them.
+
+Uploaded filenames are reduced to their basename before storage so a supplied path cannot directly choose an arbitrary server directory. The actual cached file path is stored in the JSON entry.
+
+## Data and backup behavior
+
+The important runtime data is:
+
+```text
+BASE_DIR/
+├── tags.json
+└── tag-cache/
+```
+
+Back up both together. `tags.json` contains metadata and paths, while `tag-cache` contains the uploaded file data.
+
+Because the database is a JSON file rather than a transactional database, avoid running multiple independent server instances against the same `BASE_DIR` at the same time.
 
 ## Security
 
-This is a lightweight personal tool, not a hardened internet-facing service. Important points:
+This is a lightweight personal tool, not a hardened internet-facing service.
 
 - The API key is a shared secret. Use a long random value and do not commit the real key.
 - Plain HTTP exposes the API key and payloads to anyone who can sniff that network path. Prefer a trusted LAN, WireGuard/Tailscale/other VPN, or put the service behind HTTPS before using it across untrusted networks.
 - Restrict the firewall so port `8710` is not open to the public internet unless you intentionally add proper TLS/reverse-proxy/access controls.
 - `tags.json` and `tag-cache/` can contain private material and are ignored by Git. Back them up separately if needed.
-- Uploaded filenames are handled by the server and stored on disk; only run this service for users you trust.
+- The current server enables permissive CORS (`allow_origins=["*"]`). The API key still protects the endpoints, but this configuration is intended for a trusted personal environment rather than public exposure.
+- File downloads are authorized with the same API key as other requests.
+- Only run this service for users/devices you trust.
+
+## Updating dependencies
+
+The Python packages used by this repository are listed in `requirements.txt`:
+
+```text
+fastapi
+python-multipart
+requests
+uvicorn
+```
+
+To update the globally installed copies used by this setup:
+
+```bash
+python3 -m pip install --upgrade -r requirements.txt
+```
+
+After updating FastAPI/Uvicorn or Python itself, restart the server and test `tag list`, `tag add`, and `tag get` once.
