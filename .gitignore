@@ -5,4 +5,5 @@ venv/
 .env
 tags.json
 tag-cache/
+api-key.sha256
 .DS_Store

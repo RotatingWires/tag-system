@@ -1,4 +1,5 @@
 fastapi
+keyring
 python-multipart
 requests
 uvicorn
