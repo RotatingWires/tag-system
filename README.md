@@ -78,6 +78,37 @@ If your Uvicorn/Python import setup dislikes the hyphen in `tag-server.py`, rena
 uvicorn tag_server:app --host 0.0.0.0 --port 8710
 ```
 
+### Runtime logging
+
+The server writes its normal Uvicorn/Python runtime log stream to:
+
+```text
+logs/console.log
+```
+
+The file is created at the repository root, while Uvicorn's normal console output remains unchanged when the server is launched interactively. It includes server startup/shutdown messages, access-request lines and status codes, warnings, errors, and logged exceptions.
+
+Only one log file is kept. When the next log record would push `logs/console.log` over 10 MiB, the server truncates that same file and continues writing from the beginning. It does not create numbered or rotated backup logs. The `logs/` directory is ignored by Git.
+
+Sensitive authentication material is intentionally kept out of the runtime log. The one-time generated API key is still printed directly with `print()` to the interactive console only and is never sent through Python's logging system. Uvicorn's normal access log does not include request headers, so the `x-api-key` header is not written to `console.log`. Request bodies are not logged by this project.
+
+The log can still contain client IP addresses, endpoint paths, tag names, or filenames that appear in URLs, so treat it as private runtime data.
+
+For Windows Task Scheduler, launch the Python interpreter directly with:
+
+```text
+Program/script:
+<full path to python.exe>
+
+Arguments:
+-m uvicorn tag-server:app --host 0.0.0.0 --port 8710
+
+Start in:
+<repository path>\server
+```
+
+No `cmd.exe` wrapper is required for file logging.
+
 ### First server startup
 
 If `api-key.sha256` does not exist, the server generates a cryptographically random API key and prints the real key **once** in the server console:
@@ -279,7 +310,7 @@ This is a lightweight personal tool, not a hardened internet-facing service.
 - The API key is generated with Python's `secrets` module on first startup instead of being committed or hardcoded.
 - The server persists only a SHA-256 hash of the API key and compares hashes with `hmac.compare_digest`.
 - The client persists the real API key in the operating-system keyring rather than in `client/tag`.
-- `api-key.sha256`, `tags.json`, and `tag-cache/` are ignored by Git.
+- `api-key.sha256`, `tags.json`, `tag-cache/`, and runtime `logs/` are ignored by Git.
 - Plain HTTP still exposes the API key and payloads to someone capable of sniffing the network path. This project assumes a trusted LAN/VPN unless HTTPS is added separately.
 - Restrict the firewall so port `8710` is not publicly reachable unless that is intentional.
 - File downloads are authorized with the same API key as other requests.

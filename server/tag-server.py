@@ -8,6 +8,10 @@ import json
 import os
 import secrets
 
+from runtime_logging import configure_runtime_logging
+
+configure_runtime_logging()
+
 app = FastAPI()
 
 BASE_DIR = r"C:\path\to\folder\with\this\file"

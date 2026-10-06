@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
+logs/
 tags.json
 tag-cache/
 api-key.sha256
