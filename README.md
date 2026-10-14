@@ -31,7 +31,7 @@ Client:
 - Python 3
 - `requests`
 - `keyring` for storing the API key in the operating system credential store
-- Linux clipboard/open helpers used by some commands: `xclip` and `xdg-open`
+- Linux clipboard/open helpers used by some commands: `wl-copy` (Wayland) or `xclip` (X11), and `xdg-open`
 
 Install the Python dependencies:
 
@@ -39,11 +39,16 @@ Install the Python dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-On Fedora, install the clipboard helper with:
+For KDE/Hyprland or another Wayland session, install `wl-copy`:
 
 ```bash
-sudo dnf install xclip
+# Fedora
+sudo dnf install wl-clipboard
+# Arch
+sudo pacman -S wl-clipboard
 ```
+
+For an X11 session, install `xclip` instead (Fedora: `sudo dnf install xclip`; Arch: `sudo pacman -S xclip`). The client uses `wl-copy` when `WAYLAND_DISPLAY` is set, including sessions that also have XWayland; otherwise it uses `xclip`. Run `tag get` inside your desktop session so the clipboard service is reachable. A missing/failed helper reports an error instead of claiming the copy succeeded.
 
 `xdg-open` is normally provided by the desktop environment / `xdg-utils` package. The Python `keyring` package uses the credential backend provided by the desktop session. On Linux this is normally a Secret Service-compatible keyring/wallet, and your desktop may prompt you to unlock it.
 
@@ -237,7 +242,7 @@ Print every tag and its items.
 
 ### `tag get NAME`
 
-Retrieve the tag and copy a text representation to the Linux clipboard with `xclip`.
+Retrieve **all entries** in the tag and copy them together to the Linux clipboard in one operation, in their stored order, separated by newlines. The client uses `wl-copy` on Wayland or `xclip` on X11 and preserves Unicode and leading/trailing whitespace. Empty tags leave the clipboard unchanged.
 
 For text and URL items, the actual text/URL is copied.
 
@@ -271,22 +276,40 @@ On startup, the server loads the stored API-key hash. For each request it hashes
 
 Metadata is stored in a JSON database; uploaded files are copied into `tag-cache/`.
 
-Main endpoints:
-
-```text
-GET    /tags
-GET    /tags/{tag_name}
-POST   /tags/{tag_name}/add
-DELETE /tags/{tag_name}
-GET    /tags/search/{query}
-GET    /download/{tag_name}/{filename}
-```
-
 The CLI converts commands such as `tag add` or `tag show` into HTTP requests to the server. Before making an authenticated request, it reads the API key from the operating-system keyring and sends it in the `x-api-key` request header.
 
 Uploaded filenames are reduced to their basename before storage so a supplied path cannot directly choose an arbitrary server directory. File records store only the filename; the server resolves the current path from `BASE_DIR/tag-cache/` when downloading or deleting a file.
 
 On startup, the server also removes legacy `"path"` fields from older file records in `tags.json`. This migration does not move or delete files. It only removes stale absolute-path metadata so the database remains portable if `BASE_DIR` changes.
+
+## HTTP endpoints
+
+The examples use `http://localhost:8710`. All six tag/file endpoints require the `x-api-key` header, containing the key generated during first server setup. This API uses a key header rather than login cookies or session tokens. A missing header returns 422 validation details; an incorrect key returns 403. URL-encode tag names, filenames, and search text as individual path components.
+
+| Method | Path | Request | Response / effect |
+| --- | --- | --- | --- |
+| GET | `/tags` | API-key header; no body. | JSON array of tag names in database insertion order. |
+| GET | `/tags/{tag_name}` | API-key header; no body. | `{items: [...]}` containing every stored entry in order; 404 with `detail: "Tag not found"` when absent. |
+| POST | `/tags/{tag_name}/add` | API-key header; form fields `text`, `url`, and uploaded `file`, each repeatable. | Creates a tag if needed and appends items. Returns `{status: "saved", items: [...]}` containing the complete tag after the append. Text-only requests can be form-urlencoded; file uploads use multipart form data. This endpoint does not accept a JSON item array. |
+| DELETE | `/tags/{tag_name}` | API-key header; no body. | Deletes the tag and its stored files, returning `{status: "deleted"}`; absent tags return 404. |
+| GET | `/tags/search/{query}` | API-key header; no body. | JSON array of tag names containing the query, case-insensitively. Searches names, not saved content; no matches gives `[]`. |
+| GET | `/download/{tag_name}/{filename}` | API-key header; no body. | Raw file bytes with an attachment filename. The file must be recorded under that tag and exist on disk; otherwise 404. |
+
+All successful tag operations return 200. Text/URL entries are `{type: "text" or "url", content: "..."}`; file entries are `{type: "file", filename: "..."}`. Empty text/URL fields are skipped. Empty add requests can create an empty tag. URLs are stored as supplied text, without fetching or validating their targets. Reads/searches are not paginated, and no single-item delete/update route exists.
+
+Uploads use the filename's basename in a shared `tag-cache` directory. Uploading the same filename replaces that file's bytes, including when another tag references it. Deleting a tag removes its referenced files even if another tag references those same filenames. JSON metadata and file operations are not a single atomic transaction.
+
+Examples (replace the address and placeholder key):
+
+```bash
+curl -H "x-api-key: YOUR_KEY" "http://localhost:8710/tags"
+curl -H "x-api-key: YOUR_KEY" "http://localhost:8710/tags/notes"
+curl -H "x-api-key: YOUR_KEY" -F "text=first entry" -F "text=second entry" -F "file=@./notes.txt" "http://localhost:8710/tags/notes/add"
+curl -H "x-api-key: YOUR_KEY" -o notes.txt "http://localhost:8710/download/notes/notes.txt"
+curl -X DELETE -H "x-api-key: YOUR_KEY" "http://localhost:8710/tags/notes"
+```
+
+FastAPI also serves `/openapi.json` (machine-readable schema), `/docs` (Swagger UI), and `/redoc` (ReDoc) without API-key authentication. These documentation pages describe the routes; requests to the tag/file routes still need the key. HTTP errors normally use a JSON `detail` field; validation errors use a `detail` array, and unexpected server/filesystem errors can return 500 without that shape.
 
 ## Data and backup behavior
 
@@ -339,3 +362,11 @@ python3 -m pip install --upgrade -r requirements.txt
 ```
 
 After updating FastAPI/Uvicorn, Python, or the client keyring package, restart the server and test `tag list`, `tag add`, and `tag get` once.
+
+## Development checks
+
+Run clipboard regression tests without a live server or desktop clipboard:
+
+```bash
+python3 -m unittest discover -s tests -v
+```

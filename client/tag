@@ -126,6 +126,22 @@ def show_all(args):
                 print(f"[{i}] FILE: {item['filename']}")
 
 
+def copy_to_clipboard(text):
+    if os.environ.get("WAYLAND_DISPLAY"):
+        command = ["wl-copy", "--type", "text/plain;charset=utf-8"]
+        install_hint = "Install wl-clipboard for Wayland clipboard support."
+    else:
+        command = ["xclip", "-selection", "clipboard"]
+        install_hint = "Install xclip for X11 clipboard support."
+
+    if not shutil.which(command[0]):
+        raise SystemExit(f"Clipboard helper {command[0]} was not found. {install_hint}")
+    try:
+        subprocess.run(command, input=text.encode("utf-8"), check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise SystemExit(f"Could not copy tag contents to the clipboard: {exc}") from exc
+
+
 def get(args):
     auth_headers = headers()
     res = requests.get(f"{BASE_URL}/tags/{args.name}", headers=auth_headers)
@@ -134,11 +150,14 @@ def get(args):
         return
 
     tag = res.json()
-    clipboard_text = ""
+    if not tag["items"]:
+        print("No items in tag")
+        return
+    clipboard_parts = []
 
     for item in tag["items"]:
         if item["type"] in ["text", "url"]:
-            clipboard_text += item["content"] + "\n"
+            clipboard_parts.append(item["content"])
         elif item["type"] == "file":
             filename = item["filename"]
             tmp_path = os.path.join(tempfile.gettempdir(), filename)
@@ -149,22 +168,18 @@ def get(args):
             with open(tmp_path, "wb") as f:
                 shutil.copyfileobj(r.raw, f)
 
-            clipboard_text += f"[file: {tmp_path}]\n"
+            clipboard_parts.append(f"[file: {tmp_path}]")
 
             try:
                 with open(tmp_path, "r", encoding="utf-8") as f:
-                    clipboard_text += f.read() + "\n"
+                    clipboard_parts.append(f.read())
             except (UnicodeDecodeError, OSError):
-                clipboard_text += "[binary file contents not displayed]\n"
+                clipboard_parts.append("[binary file contents not displayed]")
 
             if args.open_files:
                 subprocess.Popen(["xdg-open", tmp_path])
 
-    subprocess.run(
-        ["xclip", "-selection", "clipboard"],
-        input=clipboard_text.strip().encode(),
-        check=True,
-    )
+    copy_to_clipboard("\n".join(clipboard_parts))
     print("Copied to clipboard")
 
 
@@ -229,8 +244,9 @@ p = sub.add_parser("search", help="Search tag names")
 p.add_argument("query")
 p.set_defaults(func=search)
 
-args = parser.parse_args()
-if hasattr(args, "func"):
-    args.func(args)
-else:
-    parser.print_help()
+if __name__ == "__main__":
+    args = parser.parse_args()
+    if hasattr(args, "func"):
+        args.func(args)
+    else:
+        parser.print_help()
