@@ -3,15 +3,28 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import struct
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import zlib
 from unittest.mock import Mock, patch
 
 
 client = runpy.run_path(str(Path(__file__).parents[1] / "client" / "tag"))
 get = client["get"]
 copy_to_clipboard = client["copy_to_clipboard"]
+serve_clipboard_image = client["serve_clipboard_image"]
+
+
+def png_chunk(kind, data):
+    body = kind + data
+    return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+
+
+PNG = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+       + png_chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\xff")) + png_chunk(b"IEND", b""))
 
 
 class ClipboardTests(unittest.TestCase):
@@ -37,16 +50,46 @@ class ClipboardTests(unittest.TestCase):
             ["xclip", "-selection", "clipboard", "-target", "UTF8_STRING"], input=b"one\ntwo", check=True,
         )
 
-    def test_images_are_copied_as_image_data_on_wayland_and_x11(self):
-        image = b"\x89PNG\r\n\x1a\n\x00\xff"
-        for environment, command in [
-            ({"WAYLAND_DISPLAY": "wayland-0"}, ["wl-copy", "--type", "image/png"]),
-            ({}, ["xclip", "-selection", "clipboard", "-target", "image/png"]),
-        ]:
+    def test_images_use_qt_worker_on_wayland_and_x11(self):
+        for environment in [{"WAYLAND_DISPLAY": "wayland-0"}, {}]:
             with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True), \
-                    patch("shutil.which", return_value="clipboard-helper"), patch("subprocess.run") as run:
-                copy_to_clipboard(image, "image/png")
-                run.assert_called_once_with(command, input=image, check=True)
+                    patch("shutil.which") as which, patch("subprocess.run") as run:
+                copy_to_clipboard(PNG, "image/png", "screenshot.png")
+                command = run.call_args.args[0]
+                self.assertEqual(command[:2], [sys.executable, "-c"])
+                self.assertIn("serve_clipboard_image", command[2])
+                self.assertEqual(command[-2:], ["image/png", "screenshot.png"])
+                self.assertEqual(run.call_args.kwargs, {"input": PNG, "check": True})
+                which.assert_not_called()
+
+    def test_qt_image_offer_matches_spectacle_image_and_kde_metadata(self):
+        app = Mock()
+        with patch.dict(os.environ, {"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0"}), \
+                patch("PySide6.QtGui.QGuiApplication", return_value=app) as create_app, \
+                patch("PySide6.QtCore.QTimer.singleShot") as timer:
+            serve_clipboard_image(PNG, "image/png", "screenshot-雪.png")
+        mime, mode = app.clipboard.return_value.setMimeData.call_args.args
+        self.assertTrue(mime.hasImage())
+        self.assertEqual((mime.imageData().width(), mime.imageData().height()), (1, 1))
+        self.assertEqual(bytes(mime.data("image/png")), PNG)
+        self.assertTrue(mime.hasFormat("application/x-qt-image"))
+        self.assertTrue(mime.hasFormat("x-kde-force-image-copy"))
+        self.assertEqual(bytes(mime.data("application/x-kde-suggestedfilename")), "screenshot-雪.png".encode())
+        create_app.assert_called_once_with(["tag", "-platform", "xcb"])
+        timer.assert_called_once_with(client["IMAGE_CLIPBOARD_HOLD_MS"], app.quit)
+        app.exec.assert_called_once()
+
+    def test_invalid_image_is_rejected_before_opening_a_clipboard_connection(self):
+        with patch("PySide6.QtGui.QGuiApplication") as create_app:
+            with self.assertRaisesRegex(SystemExit, "could not be decoded"):
+                serve_clipboard_image(b"not an image", "image/png", "broken.png")
+            create_app.assert_not_called()
+
+    def test_missing_xwayland_session_is_reported(self):
+        with patch("PySide6.QtGui.QGuiApplication") as create_app:
+            with self.assertRaisesRegex(SystemExit, "X11 or XWayland"):
+                serve_clipboard_image(PNG, "image/png", "screenshot.png")
+            create_app.assert_not_called()
 
     def test_missing_wayland_helper_reports_install_instruction(self):
         with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}), \
@@ -104,7 +147,7 @@ class ClipboardTests(unittest.TestCase):
             {"type": "url", "content": "https://example.com/two"},
             {"type": "file", "filename": "screenshot #1.png"},
         ]}
-        image = b"\x89PNG\r\n\x1a\n\xff\x00"
+        image = PNG
         download = Mock(raw=io.BytesIO(image))
         events = []
         with tempfile.TemporaryDirectory() as folder, \
@@ -113,7 +156,8 @@ class ClipboardTests(unittest.TestCase):
                 patch("keyring.get_password", return_value="test-key"), \
                 patch("requests.get", side_effect=[tag, download]) as request, \
                 patch("shutil.which", return_value="/usr/bin/wl-copy"), \
-                patch("subprocess.run", side_effect=lambda *a, **kw: events.append((a[0][-1], kw["input"]))) as run, \
+                patch("subprocess.run", side_effect=lambda *a, **kw: events.append(
+                    (a[0][-2] if a[0][0] == sys.executable else a[0][-1], kw["input"]))) as run, \
                 patch("time.sleep", side_effect=lambda _: events.append("settle")), \
                 patch("subprocess.Popen") as open_file, patch("builtins.print") as output:
             get(SimpleNamespace(name="he-on-dnd-screenshot", open_files=False))

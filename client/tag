@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from urllib.parse import quote
@@ -18,6 +19,7 @@ BASE_URL = "http://server-ip-port-here"
 KEYRING_SERVICE = "tag-system"
 KEYRING_ACCOUNT = BASE_URL
 CLIPBOARD_SETTLE_SECONDS = 0.5
+IMAGE_CLIPBOARD_HOLD_MS = 2000
 
 
 def get_api_key():
@@ -131,8 +133,42 @@ def show_all(args):
                 print(f"[{i}] FILE: {item['filename']}")
 
 
-def copy_to_clipboard(data, mime_type="text/plain;charset=utf-8"):
-    if os.environ.get("WAYLAND_DISPLAY"):
+def serve_clipboard_image(data, mime_type, filename):
+    try:
+        from PySide6.QtCore import QMimeData, QTimer
+        from PySide6.QtGui import QClipboard, QGuiApplication, QImage
+    except ImportError:
+        raise SystemExit("Image copying requires PySide6. Install the client dependencies from requirements.txt.")
+
+    image = QImage.fromData(data)
+    if image.isNull():
+        raise SystemExit("The downloaded image could not be decoded; it was not copied.")
+    if not os.environ.get("DISPLAY"):
+        raise SystemExit("Image copying requires X11 or XWayland with DISPLAY set.")
+
+    # Qt's X11 clipboard works without a focused window. On Wayland, XWayland
+    # bridges these MIME offers to the desktop's Wayland clipboard manager.
+    app = QGuiApplication(["tag", "-platform", "xcb"])
+    mime = QMimeData()
+    mime.setData(mime_type, data)
+    mime.setImageData(image)
+    # Match Spectacle's explicit-image marker and paste filename metadata.
+    mime.setData("x-kde-force-image-copy", b"")
+    mime.setData("application/x-kde-suggestedfilename", os.fsencode(filename))
+    app.clipboard().setMimeData(mime, QClipboard.Mode.Clipboard)
+    QTimer.singleShot(IMAGE_CLIPBOARD_HOLD_MS, app.quit)
+    app.exec()
+
+
+def copy_to_clipboard(data, mime_type="text/plain;charset=utf-8", filename=""):
+    if mime_type.startswith("image/"):
+        command = [
+            sys.executable, "-c",
+            "import runpy,sys; runpy.run_path(sys.argv[1])['serve_clipboard_image']"
+            "(sys.stdin.buffer.read(),sys.argv[2],sys.argv[3])",
+            os.path.abspath(__file__), mime_type, filename,
+        ]
+    elif os.environ.get("WAYLAND_DISPLAY"):
         command = ["wl-copy", "--type", mime_type]
         install_hint = "Install wl-clipboard for Wayland clipboard support."
     else:
@@ -140,7 +176,7 @@ def copy_to_clipboard(data, mime_type="text/plain;charset=utf-8"):
         command = ["xclip", "-selection", "clipboard", "-target", target]
         install_hint = "Install xclip for X11 clipboard support."
 
-    if not shutil.which(command[0]):
+    if not mime_type.startswith("image/") and not shutil.which(command[0]):
         raise SystemExit(f"Clipboard helper {command[0]} was not found. {install_hint}")
     try:
         subprocess.run(command, input=data.encode("utf-8") if isinstance(data, str) else data, check=True)
@@ -165,7 +201,7 @@ def get(args):
 
     for item in tag["items"]:
         if item["type"] in ["text", "url"]:
-            clipboard_items.append((item["content"], "text/plain;charset=utf-8"))
+            clipboard_items.append((item["content"], "text/plain;charset=utf-8", ""))
         elif item["type"] == "file":
             filename = item["filename"]
             if download_dir is None:
@@ -180,24 +216,24 @@ def get(args):
 
             mime_type, encoding = mimetypes.guess_type(filename)
             if mime_type and mime_type.startswith("image/") and encoding is None:
-                clipboard_items.append((tmp_path.read_bytes(), mime_type))
+                clipboard_items.append((tmp_path.read_bytes(), mime_type, tmp_path.name))
             else:
                 try:
                     text = tmp_path.read_text(encoding="utf-8")
                 except UnicodeDecodeError:
                     text = None
                 if text and "\x00" not in text:
-                    clipboard_items.append((text, "text/plain;charset=utf-8"))
+                    clipboard_items.append((text, "text/plain;charset=utf-8", ""))
                 else:
-                    clipboard_items.append((tmp_path.resolve().as_uri() + "\r\n", "text/uri-list"))
+                    clipboard_items.append((tmp_path.resolve().as_uri() + "\r\n", "text/uri-list", ""))
 
             if args.open_files:
                 subprocess.Popen(["xdg-open", str(tmp_path)])
 
-    for index, (data, mime_type) in enumerate(clipboard_items):
+    for index, (data, mime_type, filename) in enumerate(clipboard_items):
         if index:
             time.sleep(CLIPBOARD_SETTLE_SECONDS)
-        copy_to_clipboard(data, mime_type)
+        copy_to_clipboard(data, mime_type, filename)
     count = len(clipboard_items)
     print(f"Copied {count} {'item' if count == 1 else 'items'} to clipboard")
     if count > 1:

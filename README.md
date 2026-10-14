@@ -30,8 +30,10 @@ Client:
 
 - Python 3
 - `requests`
+- `PySide6` for native Qt image clipboard data
 - `keyring` for storing the API key in the operating system credential store
-- Linux clipboard/open helpers used by some commands: `wl-copy` (Wayland) or `xclip` (X11), and `xdg-open`
+- Linux clipboard/open helpers for text and file entries: `wl-copy` (Wayland) or `xclip` (X11), and `xdg-open`
+- X11 or XWayland with `DISPLAY` available for image copies
 
 Install the Python dependencies:
 
@@ -48,7 +50,7 @@ sudo dnf install wl-clipboard
 sudo pacman -S wl-clipboard
 ```
 
-For an X11 session, install `xclip` instead (Fedora: `sudo dnf install xclip`; Arch: `sudo pacman -S xclip`). The client uses `wl-copy` when `WAYLAND_DISPLAY` is set, including sessions that also have XWayland; otherwise it uses `xclip`. Run `tag get` inside your desktop session so the clipboard service is reachable. A missing/failed helper reports an error instead of claiming the copy succeeded.
+For an X11 session, install `xclip` instead (Fedora: `sudo dnf install xclip`; Arch: `sudo pacman -S xclip`). For text/file-URI copies, the client uses `wl-copy` when `WAYLAND_DISPLAY` is set, including sessions that also have XWayland; otherwise it uses `xclip`. Image copies use Qt through PySide6, as described below. Run `tag get` inside your desktop session so the clipboard service is reachable. A missing/failed helper reports an error instead of claiming the copy succeeded.
 
 `xdg-open` is normally provided by the desktop environment / `xdg-utils` package. The Python `keyring` package uses the credential backend provided by the desktop session. On Linux this is normally a Secret Service-compatible keyring/wallet, and your desktop may prompt you to unlock it.
 
@@ -245,15 +247,17 @@ Print every tag and its items.
 Retrieve **all entries** in the tag and copy each one separately, in stored order, so a running clipboard manager can keep them as separate history entries. For example, a tag containing two URLs and a PNG produces two text copies and one image copy. Use the desktop clipboard-history picker to choose an earlier item; ordinary paste uses the last copied item.
 
 - Text and URL entries copy their actual contents, preserving Unicode and whitespace.
-- Image uploads copy the actual image bytes using their image MIME type (for example `image/png` or `image/jpeg`), so you can paste an image into an application that accepts that format.
+- Image uploads copy a decoded Qt image plus the original encoded image format, allowing Qt to expose native image formats for pasting. The payload also includes KDE's explicit-image marker and a suggested filename, matching Spectacle's image-copy behavior.
 - UTF-8 text-file uploads copy the file's contents as one text entry.
 - Other binary files and empty text files copy a local file URI (`text/uri-list`) for applications that support pasting files.
 
 Files are downloaded into a new `tag-*` temporary directory for each retrieval, so later retrievals do not overwrite files referenced by earlier history entries. Temporary-file retention follows your operating system's cleanup policy. Names containing spaces, `#`, or other URL-special characters are encoded in download requests.
 
-The client uses `wl-copy` on Wayland or `xclip` on X11. It waits half a second between clipboard updates to give the clipboard manager time to capture each entry. The OS clipboard itself holds one current item: without a running history manager, only the last copy remains available. History limits, duplicate suppression, supported image formats, and recording speed depend on that manager. Empty tags leave the clipboard unchanged.
+Text and file-URI copies use `wl-copy` on Wayland or `xclip` on X11. Updates are spaced by half a second so the clipboard manager can capture each entry. Image copies run a separate Qt clipboard provider that stays in its event loop for two seconds, matching Spectacle's transfer lifetime. The OS clipboard itself holds one current item: without a running history manager, only the last copy remains available. History limits, duplicate suppression, supported image formats, and recording speed depend on that manager. Empty tags leave the clipboard unchanged.
 
-For **KDE Plasma**, open the clipboard widget's **Configure Clipboard...** settings and enable **Save images** to retain image entries in history. [KDE documents this option here](https://docs.kde.org/stable_kf6/en/plasma-workspace/klipper/preferences.html). Other desktops need a clipboard-history manager configured to record both text and images.
+The image payload follows [Spectacle's export implementation](https://github.com/KDE/spectacle/blob/master/src/ExportManager.cpp): an image MIME format, a Qt image object, `x-kde-force-image-copy`, and `application/x-kde-suggestedfilename`. Klipper recognizes the explicit-image marker and can retain these images even when ordinary image-history recording is disabled.
+
+The image provider uses Qt's X11 clipboard without opening a window. On a Wayland desktop, XWayland bridges those clipboard offers to the Wayland clipboard; `DISPLAY` must be available. Install PySide6 with the client dependencies, or your distro's Python PySide6 package. A Wayland-only session without XWayland cannot use this image provider; text/file copies still use their normal Wayland helper. Other desktops need a clipboard-history manager configured to capture image data.
 
 Use:
 
@@ -359,6 +363,7 @@ The Python packages used by this repository are listed in `requirements.txt`:
 ```text
 fastapi
 keyring
+PySide6
 python-multipart
 requests
 uvicorn
