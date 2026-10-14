@@ -242,11 +242,18 @@ Print every tag and its items.
 
 ### `tag get NAME`
 
-Retrieve **all entries** in the tag and copy them together to the Linux clipboard in one operation, in their stored order, separated by newlines. The client uses `wl-copy` on Wayland or `xclip` on X11 and preserves Unicode and leading/trailing whitespace. Empty tags leave the clipboard unchanged.
+Retrieve **all entries** in the tag and copy each one separately, in stored order, so a running clipboard manager can keep them as separate history entries. For example, a tag containing two URLs and a PNG produces two text copies and one image copy. Use the desktop clipboard-history picker to choose an earlier item; ordinary paste uses the last copied item.
 
-For text and URL items, the actual text/URL is copied.
+- Text and URL entries copy their actual contents, preserving Unicode and whitespace.
+- Image uploads copy the actual image bytes using their image MIME type (for example `image/png` or `image/jpeg`), so you can paste an image into an application that accepts that format.
+- UTF-8 text-file uploads copy the file's contents as one text entry.
+- Other binary files and empty text files copy a local file URI (`text/uri-list`) for applications that support pasting files.
 
-For file items, the client downloads the file into the local temporary directory. The clipboard text includes the downloaded path. If the downloaded file is UTF-8-readable text, its text contents are appended too. Binary file bytes are **not** placed on the clipboard as a native file object by the current client; binary entries are represented by their downloaded path plus a note that their contents are not displayed.
+Files are downloaded into a new `tag-*` temporary directory for each retrieval, so later retrievals do not overwrite files referenced by earlier history entries. Temporary-file retention follows your operating system's cleanup policy. Names containing spaces, `#`, or other URL-special characters are encoded in download requests.
+
+The client uses `wl-copy` on Wayland or `xclip` on X11. It waits half a second between clipboard updates to give the clipboard manager time to capture each entry. The OS clipboard itself holds one current item: without a running history manager, only the last copy remains available. History limits, duplicate suppression, supported image formats, and recording speed depend on that manager. Empty tags leave the clipboard unchanged.
+
+For **KDE Plasma**, open the clipboard widget's **Configure Clipboard...** settings and enable **Save images** to retain image entries in history. [KDE documents this option here](https://docs.kde.org/stable_kf6/en/plasma-workspace/klipper/preferences.html). Other desktops need a clipboard-history manager configured to record both text and images.
 
 Use:
 
@@ -255,6 +262,8 @@ tag get NAME --open-files
 ```
 
 to also open each downloaded file with `xdg-open`.
+
+After updating the repo, also update the client executable you actually run. If `~/bin/tag` is a copy, pulling this repo does not update that copy. Copy the updated `client/tag` there, then set its `BASE_URL` to your existing server address as described in Client setup. Keep the server URL the same so `tag configure` continues to use the same keyring account.
 
 ### `tag list`
 
