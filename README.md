@@ -229,7 +229,7 @@ tag add mixed --text "hello" --url "https://example.com" --file ./photo.png
 
 ### `tag show NAME`
 
-Print the items stored under one tag. File entries show their filename and the server-side Windows path recorded in `tags.json`.
+Print the items stored under one tag. File entries show their filename. Absolute server paths are not stored in `tags.json`.
 
 ### `tag show-all`
 
@@ -284,7 +284,9 @@ GET    /download/{tag_name}/{filename}
 
 The CLI converts commands such as `tag add` or `tag show` into HTTP requests to the server. Before making an authenticated request, it reads the API key from the operating-system keyring and sends it in the `x-api-key` request header.
 
-Uploaded filenames are reduced to their basename before storage so a supplied path cannot directly choose an arbitrary server directory. The actual cached file path is stored in the JSON entry.
+Uploaded filenames are reduced to their basename before storage so a supplied path cannot directly choose an arbitrary server directory. File records store only the filename; the server resolves the current path from `BASE_DIR/tag-cache/` when downloading or deleting a file.
+
+On startup, the server also removes legacy `"path"` fields from older file records in `tags.json`. This migration does not move or delete files. It only removes stale absolute-path metadata so the database remains portable if `BASE_DIR` changes.
 
 ## Data and backup behavior
 
@@ -297,7 +299,7 @@ BASE_DIR/
 └── api-key.sha256
 ```
 
-Back up `tags.json` and `tag-cache/` together. `tags.json` contains metadata and paths, while `tag-cache` contains the uploaded file data.
+Back up `tags.json` and `tag-cache/` together. `tags.json` contains tag metadata and stored filenames, while `tag-cache` contains the uploaded file data. Because file records no longer contain absolute paths, moving the complete data directory does not require rewriting file entries in the database.
 
 `api-key.sha256` can also be backed up if you want a restored server to keep accepting the same client key. If it is lost, start the server without it to generate a new key and run `tag configure` again on the clients.
 
