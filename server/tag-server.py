@@ -31,6 +31,19 @@ def save_db(db):
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2)
 
+def migrate_legacy_file_paths():
+    db = load_db()
+    changed = False
+
+    for items in db.values():
+        for item in items:
+            if item.get("type") == "file" and "path" in item:
+                item.pop("path", None)
+                changed = True
+
+    if changed:
+        save_db(db)
+
 def hash_api_key(api_key):
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
@@ -63,6 +76,7 @@ def load_or_create_api_key_hash():
     return api_key_hash
 
 API_KEY_HASH = load_or_create_api_key_hash()
+migrate_legacy_file_paths()
 
 def auth(x_api_key):
     supplied_hash = hash_api_key(x_api_key)
@@ -97,7 +111,7 @@ async def add_tag(
         filepath = os.path.join(TMP_DIR, safe_name)
         with open(filepath, "wb") as destination:
             destination.write(await uploaded_file.read())
-        db[tag_name].append({"type": "file", "filename": safe_name, "path": filepath})
+        db[tag_name].append({"type": "file", "filename": safe_name})
 
     save_db(db)
     return {"status": "saved", "items": db[tag_name]}
@@ -125,7 +139,7 @@ def delete_tag(tag_name: str, x_api_key: str = Header(...)):
 
     for item in db[tag_name]:
         if item["type"] == "file":
-            filepath = item["path"]
+            filepath = os.path.join(TMP_DIR, item["filename"])
             if os.path.exists(filepath):
                 os.remove(filepath)
 
@@ -147,5 +161,8 @@ def download_file(tag_name: str, filename: str, x_api_key: str = Header(...)):
         raise HTTPException(404, detail="Tag not found")
     for item in db[tag_name]:
         if item["type"] == "file" and item["filename"] == filename:
-            return FileResponse(item["path"], filename=filename)
+            filepath = os.path.join(TMP_DIR, item["filename"])
+            if not os.path.isfile(filepath):
+                raise HTTPException(404, detail="File not found on disk")
+            return FileResponse(filepath, filename=filename)
     raise HTTPException(404, detail="File not found")

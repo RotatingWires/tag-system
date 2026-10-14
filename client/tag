@@ -94,7 +94,7 @@ def show(args):
         if t in ["text", "url"]:
             print(f"[{i}] {t.upper()}: {item['content']}")
         elif t == "file":
-            print(f"[{i}] FILE: {item['filename']} (Windows path: {item['path']})")
+            print(f"[{i}] FILE: {item['filename']}")
 
 
 def show_all(args):
@@ -123,7 +123,7 @@ def show_all(args):
             if t in ["text", "url"]:
                 print(f"[{i}] {t.upper()}: {item['content']}")
             elif t == "file":
-                print(f"[{i}] FILE: {item['filename']} (Windows path: {item['path']})")
+                print(f"[{i}] FILE: {item['filename']}")
 
 
 def get(args):
