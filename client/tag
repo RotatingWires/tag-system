@@ -197,11 +197,12 @@ def get(args):
         print("No items in tag")
         return
     clipboard_items = []
+    text_entries = []
     download_dir = None
 
     for item in tag["items"]:
         if item["type"] in ["text", "url"]:
-            clipboard_items.append((item["content"], "text/plain;charset=utf-8", ""))
+            text_entries.append(item["content"])
         elif item["type"] == "file":
             filename = item["filename"]
             if download_dir is None:
@@ -229,6 +230,9 @@ def get(args):
 
             if args.open_files:
                 subprocess.Popen(["xdg-open", str(tmp_path)])
+
+    if text_entries:
+        clipboard_items.insert(0, ("\n".join(text_entries), "text/plain;charset=utf-8", ""))
 
     for index, (data, mime_type, filename) in enumerate(clipboard_items):
         if index:
@@ -285,7 +289,7 @@ p.set_defaults(func=show)
 p = sub.add_parser("show-all", help="Show every tag and all stored items")
 p.set_defaults(func=show_all)
 
-p = sub.add_parser("get", help="Copy each tag entry separately for clipboard history")
+p = sub.add_parser("get", help="Copy combined text/URLs and separate files to clipboard history")
 p.add_argument("name")
 p.add_argument("--open-files", action="store_true", help="Open downloaded files with xdg-open")
 p.set_defaults(func=get)

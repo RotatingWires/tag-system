@@ -104,7 +104,7 @@ class ClipboardTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Could not copy tag contents"):
                 copy_to_clipboard("one\ntwo")
 
-    def test_get_copies_every_mixed_entry_separately_in_stored_order(self):
+    def test_get_combines_saved_text_and_urls_but_keeps_files_separate(self):
         items = [
             {"type": "text", "content": "  first"},
             {"type": "url", "content": "https://example.com"},
@@ -126,21 +126,21 @@ class ClipboardTests(unittest.TestCase):
                 patch("subprocess.Popen") as open_file, \
                 patch("builtins.print") as output:
             get(SimpleNamespace(name="mixed", open_files=True))
-            expected = [b"  first", b"https://example.com", b"file text\n", "雪".encode(),
-                        (Path(folder, "image.bin").as_uri() + "\r\n").encode(), b"last  "]
+            expected = ["  first\nhttps://example.com\n雪\nlast  ".encode(), b"file text\n",
+                        (Path(folder, "image.bin").as_uri() + "\r\n").encode()]
             self.assertEqual([c.kwargs["input"] for c in run.call_args_list], expected)
-            self.assertEqual(run.call_args_list[4].args[0][-1], "text/uri-list")
-            self.assertEqual(sleep.call_count, len(items) - 1)
+            self.assertEqual(run.call_args_list[2].args[0][-1], "text/uri-list")
+            self.assertEqual(sleep.call_count, len(expected) - 1)
             for call in sleep.call_args_list:
                 self.assertEqual(call.args, (client["CLIPBOARD_SETTLE_SECONDS"],))
             self.assertEqual(open_file.call_count, 2)
             self.assertEqual(request.call_count, 3)
             for call in request.call_args_list:
                 self.assertEqual(call.kwargs["headers"], {"x-api-key": "test-key"})
-            output.assert_any_call("Copied 6 items to clipboard")
+            output.assert_any_call("Copied 3 items to clipboard")
             output.assert_any_call("Use clipboard history to select earlier items")
 
-    def test_two_urls_and_screenshot_create_three_typed_clipboard_entries(self):
+    def test_two_urls_and_screenshot_create_one_text_and_one_image_entry(self):
         tag = Mock(status_code=200)
         tag.json.return_value = {"items": [
             {"type": "url", "content": "https://example.com/one"},
@@ -162,23 +162,55 @@ class ClipboardTests(unittest.TestCase):
                 patch("subprocess.Popen") as open_file, patch("builtins.print") as output:
             get(SimpleNamespace(name="he-on-dnd-screenshot", open_files=False))
             self.assertEqual(events, [
-                ("text/plain;charset=utf-8", b"https://example.com/one"), "settle",
-                ("text/plain;charset=utf-8", b"https://example.com/two"), "settle",
+                ("text/plain;charset=utf-8", b"https://example.com/one\nhttps://example.com/two"), "settle",
                 ("image/png", image),
             ])
-            self.assertEqual(run.call_count, 3)
+            self.assertEqual(run.call_count, 2)
             self.assertTrue(request.call_args.args[0].endswith("/he-on-dnd-screenshot/screenshot%20%231.png"))
             self.assertEqual(Path(folder, "screenshot #1.png").read_bytes(), image)
             open_file.assert_not_called()
-            output.assert_any_call("Copied 3 items to clipboard")
+            output.assert_any_call("Copied 2 items to clipboard")
+
+    def test_text_only_tag_is_one_clipboard_item_without_waiting(self):
+        tag = Mock(status_code=200)
+        tag.json.return_value = {"items": [
+            {"type": "text", "content": "  first"}, {"type": "url", "content": "https://example.com"},
+            {"type": "text", "content": "last  "},
+        ]}
+        with patch("keyring.get_password", return_value="test-key"), patch("requests.get", return_value=tag), \
+                patch("shutil.which", return_value="/usr/bin/xclip"), \
+                patch("subprocess.run") as run, patch("time.sleep") as sleep, patch("builtins.print") as output:
+            get(SimpleNamespace(name="text-only", open_files=False))
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.kwargs["input"], b"  first\nhttps://example.com\nlast  ")
+            sleep.assert_not_called()
+            output.assert_called_once_with("Copied 1 item to clipboard")
+
+    def test_images_only_are_individual_items_without_an_empty_text_copy(self):
+        tag = Mock(status_code=200)
+        tag.json.return_value = {"items": [
+            {"type": "file", "filename": "first.png"}, {"type": "file", "filename": "second.png"},
+        ]}
+        with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
+                patch("keyring.get_password", return_value="test-key"), \
+                patch("requests.get", side_effect=[tag, Mock(raw=io.BytesIO(PNG)), Mock(raw=io.BytesIO(PNG))]), \
+                patch("subprocess.run") as run, patch("time.sleep") as sleep, patch("builtins.print"):
+            get(SimpleNamespace(name="images-only", open_files=False))
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual([c.args[0][-1] for c in run.call_args_list], ["first.png", "second.png"])
+            self.assertTrue(all(c.kwargs["input"] == PNG for c in run.call_args_list))
+            sleep.assert_called_once_with(client["CLIPBOARD_SETTLE_SECONDS"])
 
     def test_clipboard_failure_stops_without_reporting_all_entries_copied(self):
         tag = Mock(status_code=200)
         tag.json.return_value = {"items": [
-            {"type": "text", "content": "one"}, {"type": "text", "content": "two"},
-            {"type": "text", "content": "three"},
+            {"type": "text", "content": "one"}, {"type": "file", "filename": "image.png"},
+            {"type": "url", "content": "https://example.com"},
         ]}
-        with patch("keyring.get_password", return_value="test-key"), patch("requests.get", return_value=tag), \
+        download = Mock(raw=io.BytesIO(PNG))
+        with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
+                patch("keyring.get_password", return_value="test-key"), \
+                patch("requests.get", side_effect=[tag, download]), \
                 patch("shutil.which", return_value="/usr/bin/xclip"), patch("time.sleep"), \
                 patch("subprocess.run", side_effect=[None, subprocess.CalledProcessError(1, "xclip")]) as run, \
                 patch("builtins.print") as output:

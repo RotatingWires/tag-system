@@ -244,11 +244,11 @@ Print every tag and its items.
 
 ### `tag get NAME`
 
-Retrieve **all entries** in the tag and copy each one separately, in stored order, so a running clipboard manager can keep them as separate history entries. For example, a tag containing two URLs and a PNG produces two text copies and one image copy. Use the desktop clipboard-history picker to choose an earlier item; ordinary paste uses the last copied item.
+Retrieve **all entries** in the tag and combine saved text and URL entries into **one text clipboard item**, separated by newlines in their stored order. Images and other uploaded files are copied as individual items after that text item. For example, two URLs plus a PNG produce one text item containing both URLs and one image item. Use the desktop clipboard-history picker to choose an earlier item; ordinary paste uses the last copied item.
 
-- Text and URL entries copy their actual contents, preserving Unicode and whitespace.
+- Saved text and URL entries share one clipboard item, preserving Unicode and whitespace within each entry.
 - Image uploads copy a decoded Qt image plus the original encoded image format, allowing Qt to expose native image formats for pasting. The payload also includes KDE's explicit-image marker and a suggested filename, matching Spectacle's image-copy behavior.
-- UTF-8 text-file uploads copy the file's contents as one text entry.
+- UTF-8 text-file uploads copy the file's contents as a separate text item; they are uploaded files rather than saved text/URL entries.
 - Other binary files and empty text files copy a local file URI (`text/uri-list`) for applications that support pasting files.
 
 Files are downloaded into a new `tag-*` temporary directory for each retrieval, so later retrievals do not overwrite files referenced by earlier history entries. Temporary-file retention follows your operating system's cleanup policy. Names containing spaces, `#`, or other URL-special characters are encoded in download requests.
