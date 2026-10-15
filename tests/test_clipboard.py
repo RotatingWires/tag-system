@@ -19,7 +19,8 @@ copy_to_clipboard = client["copy_to_clipboard"]
 serve_clipboard_image = client["serve_clipboard_image"]
 start_image_clipboard = client["start_image_clipboard"]
 wait_for_clipboard_history = client["wait_for_clipboard_history"]
-clipboard_history_connection = client["clipboard_history_connection"]
+clipboard_history_command = client["clipboard_history_command"]
+read_history_reply = client["read_history_reply"]
 
 
 def png_chunk(kind, data):
@@ -177,135 +178,126 @@ class ClipboardTests(unittest.TestCase):
                 copy_to_clipboard("one\ntwo")
 
     def test_klipper_confirmation_skips_the_fixed_text_wait(self):
-        from PySide6.QtDBus import QDBusMessage
-
-        bus = Mock()
-        bus.call.return_value = Mock(
-            type=lambda: QDBusMessage.MessageType.ReplyMessage,
-            arguments=lambda: ["  first\nhttps://example.com\n雪  "],
-        )
-        with patch("time.sleep") as sleep:
-            wait_for_clipboard_history("  first\nhttps://example.com\n雪  ", "text/plain;charset=utf-8", bus)
+        command = ["gdbus", "call"]
+        text = "  first\nhttps://example.com\n雪  "
+        with patch("subprocess.run", return_value=SimpleNamespace(stdout=repr((text,)))) as run, \
+                patch("time.sleep") as sleep:
+            wait_for_clipboard_history(text, "text/plain;charset=utf-8", command)
         sleep.assert_not_called()
-        message = bus.call.call_args.args[0]
-        self.assertEqual(message.service(), "org.kde.klipper")
-        self.assertEqual(message.path(), "/klipper")
-        self.assertEqual(message.member(), "getClipboardContents")
-        self.assertFalse(message.autoStartService())
+        run.assert_called_once_with(command, check=True, capture_output=True, text=True,
+                                    timeout=client["CLIPBOARD_HISTORY_QUERY_SECONDS"])
 
-    def test_owned_qt_application_is_destroyed_after_success_and_failure(self):
-        for connected, fail in [(True, False), (False, False), (True, True)]:
-            with self.subTest(connected=connected, fail=fail):
-                app = Mock()
-                bus = Mock(isConnected=lambda: connected)
-                with patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"), \
-                        patch("PySide6.QtCore.QCoreApplication") as application, \
-                        patch("PySide6.QtDBus.QDBusConnection.sessionBus", return_value=bus):
-                    application.instance.return_value = None
-                    application.return_value = app
-                    try:
-                        with clipboard_history_connection() as connection:
-                            self.assertIs(connection, bus if connected else None)
-                            app.shutdown.assert_not_called()
-                            if fail:
-                                raise OSError("Copy failed")
-                    except OSError:
-                        self.assertTrue(fail)
-                    app.shutdown.assert_called_once_with()
-
-    def test_existing_qt_application_belongs_to_its_caller(self):
-        app = Mock()
-        bus = Mock(isConnected=lambda: True)
+    def test_history_probe_targets_existing_unique_owner(self):
         with patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"), \
-                patch("PySide6.QtCore.QCoreApplication") as application, \
-                patch("PySide6.QtDBus.QDBusConnection.sessionBus", return_value=bus):
-            application.instance.return_value = app
-            with clipboard_history_connection() as connection:
-                self.assertIs(connection, bus)
-            application.assert_not_called()
-            app.shutdown.assert_not_called()
+                patch("shutil.which", return_value="/usr/bin/gdbus"), \
+                patch("subprocess.run", return_value=SimpleNamespace(stdout="(':1.42',)\n")) as run:
+            command = clipboard_history_command()
+        self.assertEqual(command, ["/usr/bin/gdbus", "call", "--session", "--dest", ":1.42",
+                                   "--object-path", "/klipper", "--method",
+                                   "org.kde.klipper.klipper.getClipboardContents"])
+        lookup = run.call_args.args[0]
+        self.assertEqual(lookup[-2:], ["org.freedesktop.DBus.GetNameOwner", "org.kde.klipper"])
+        self.assertEqual(lookup[lookup.index("--dest") + 1], "org.freedesktop.DBus")
 
-    def test_non_kde_capture_does_not_create_a_qt_application(self):
-        with patch("PySide6.QtCore.QCoreApplication") as application:
-            with clipboard_history_connection() as connection:
-                self.assertIsNone(connection)
-            application.assert_not_called()
+    def test_missing_helper_or_non_kde_does_not_query_history(self):
+        with patch("shutil.which") as which, patch("subprocess.run") as run:
+            self.assertIsNone(clipboard_history_command())
+            which.assert_not_called()
+            with patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"):
+                which.return_value = None
+                self.assertIsNone(clipboard_history_command())
+            run.assert_not_called()
 
-    def test_real_qt_probe_cleans_up_before_python_exit_with_glib_initialized(self):
-        from ctypes.util import find_library
+    def test_missing_or_invalid_owner_does_not_build_an_activation_command(self):
+        for reply in ["('org.kde.klipper',)", "()", "not a tuple"]:
+            with self.subTest(reply=reply), patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"), \
+                    patch("shutil.which", return_value="/usr/bin/gdbus"), \
+                    patch("subprocess.run", return_value=SimpleNamespace(stdout=reply)):
+                self.assertIsNone(clipboard_history_command())
 
-        glib = find_library("glib-2.0")
-        if glib is None:
-            self.skipTest("GLib is unavailable on this platform")
-        code = """
-import ctypes, runpy, sys
-from PySide6.QtCore import QCoreApplication
-glib = ctypes.CDLL(sys.argv[2])
-glib.g_main_context_default.restype = ctypes.c_void_p
-glib.g_main_context_push_thread_default.argtypes = [ctypes.c_void_p]
-glib.g_main_context_pop_thread_default.argtypes = [ctypes.c_void_p]
-context = glib.g_main_context_default()
-glib.g_main_context_push_thread_default(context)
-probe = runpy.run_path(sys.argv[1])['clipboard_history_connection']
-try:
-    for _ in range(3):
-        with probe():
-            assert QCoreApplication.instance() is not None
-        assert QCoreApplication.instance() is None
-finally:
-    glib.g_main_context_pop_thread_default(context)
-"""
-        result = subprocess.run(
-            [sys.executable, "-c", code, str(Path(__file__).parents[1] / "client" / "tag"), glib],
-            env={**os.environ, "XDG_CURRENT_DESKTOP": "KDE", "G_DEBUG": "fatal-criticals"},
-            capture_output=True, text=True, timeout=10,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("GLib-CRITICAL", result.stderr)
-        self.assertNotIn("g_main_context_pop_thread_default", result.stderr)
+    def test_history_reply_preserves_gvariant_string_escaping(self):
+        replies = [
+            ("('hello',)\n", "hello"),
+            (r"('both URLs\n雪',)", "both URLs\n雪"),
+            (r"""("quote: '\" and slash \\",)""", "quote: '\" and slash \\"),
+            (r"('\u001b\t\r\n',)", "\x1b\t\r\n"),
+            ("('',)", ""),
+        ]
+        for reply, expected in replies:
+            with self.subTest(reply=reply), patch("subprocess.run", return_value=SimpleNamespace(stdout=reply)):
+                self.assertEqual(read_history_reply(["gdbus"], 0.1), expected)
+
+    def test_history_reply_errors_and_malformed_data_fall_back(self):
+        for error in [FileNotFoundError(), subprocess.CalledProcessError(1, "gdbus"),
+                      subprocess.TimeoutExpired("gdbus", 0.1)]:
+            with self.subTest(error=type(error)), patch("subprocess.run", side_effect=error):
+                self.assertIsNone(read_history_reply(["gdbus"], 0.1))
+        for output in ["invalid", "('one', 'two')", "['text']", "(42,)", "(b'bytes',)",
+                       "__import__('os').abort()"]:
+            with self.subTest(output=output), patch("subprocess.run", return_value=SimpleNamespace(stdout=output)):
+                self.assertIsNone(read_history_reply(["gdbus"], 0.1))
 
     def test_klipper_waits_for_exact_text_instead_of_any_history_change(self):
-        from PySide6.QtDBus import QDBusMessage
-
-        bus = Mock()
-        bus.call.side_effect = [
-            Mock(type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["older text"]),
-            Mock(type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["both URLs\n雪"]),
-        ]
-        with patch("time.sleep") as sleep:
-            wait_for_clipboard_history("both URLs\n雪", "text/plain;charset=utf-8", bus)
-        self.assertEqual(bus.call.call_count, 2)
+        replies = [SimpleNamespace(stdout="('older text',)"), SimpleNamespace(stdout="('both URLs\\n雪',)")]
+        with patch("subprocess.run", side_effect=replies) as run, patch("time.sleep") as sleep:
+            wait_for_clipboard_history("both URLs\n雪", "text/plain;charset=utf-8", ["gdbus", "call"])
+        self.assertEqual(run.call_count, 2)
         sleep.assert_called_once()
         self.assertLessEqual(sleep.call_args.args[0], 0.01)
 
     def test_unavailable_klipper_preserves_the_remaining_capture_window(self):
-        from PySide6.QtDBus import QDBusMessage
-
-        bus = Mock()
-        bus.call.return_value = Mock(type=lambda: QDBusMessage.MessageType.ErrorMessage)
-        with patch("time.monotonic", side_effect=[0, 0, 0, 0.05]), patch("time.sleep") as sleep:
-            wait_for_clipboard_history("hello", "text/plain;charset=utf-8", bus)
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("gdbus", 0.1)), \
+                patch("time.monotonic", side_effect=[0, 0, 0, 0.05]), patch("time.sleep") as sleep:
+            wait_for_clipboard_history("hello", "text/plain;charset=utf-8", ["gdbus", "call"])
         sleep.assert_called_once_with(0.45)
 
     def test_klipper_does_not_shortcut_waiting_for_images_or_file_uris(self):
         for mime in ["image/png", "text/uri-list"]:
-            with self.subTest(mime=mime), patch("time.monotonic", return_value=0), patch("time.sleep") as sleep:
-                bus = Mock()
-                wait_for_clipboard_history(PNG, mime, bus)
-                bus.call.assert_not_called()
+            with self.subTest(mime=mime), patch("time.monotonic", return_value=0), \
+                    patch("subprocess.run") as run, patch("time.sleep") as sleep:
+                wait_for_clipboard_history(PNG, mime, ["gdbus", "call"])
+                run.assert_not_called()
                 sleep.assert_called_once_with(client["CLIPBOARD_SETTLE_SECONDS"])
 
     def test_stale_klipper_history_cannot_exceed_capture_window(self):
-        from PySide6.QtDBus import QDBusMessage
-
-        bus = Mock()
-        bus.call.return_value = Mock(
-            type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["old"],
-        )
-        with patch("time.monotonic", side_effect=[0, 0, 0, 0.1, 0.6, 0.6]), patch("time.sleep") as sleep:
-            wait_for_clipboard_history("new", "text/plain;charset=utf-8", bus)
-        bus.call.assert_called_once()
+        with patch("subprocess.run", return_value=SimpleNamespace(stdout="('old',)")) as run, \
+                patch("time.monotonic", side_effect=[0, 0, 0, 0.1, 0.6, 0.6]), patch("time.sleep") as sleep:
+            wait_for_clipboard_history("new", "text/plain;charset=utf-8", ["gdbus", "call"])
+        run.assert_called_once()
         sleep.assert_called_once_with(0.01)
+
+
+    def test_fast_history_probe_runs_without_loading_qt_into_cli(self):
+        code = """
+import importlib.abc, runpy, sys
+class BlockQt(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'PySide6' or fullname.startswith('PySide6.'):
+            raise AssertionError('Qt must stay out of the CLI history probe')
+sys.meta_path.insert(0, BlockQt())
+client = runpy.run_path(sys.argv[1])
+command = client['clipboard_history_command']()
+assert command is not None
+client['wait_for_clipboard_history'](sys.argv[2], 'text/plain;charset=utf-8', command)
+assert not any(name.startswith('PySide6') for name in sys.modules)
+"""
+        expected = "two URLs\nquotes: '\" and 雪"
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory, "gdbus")
+            helper.write_text(
+                f"#!{sys.executable}\nimport sys\n"
+                f"value = ':1.42' if sys.argv[-1] == 'org.kde.klipper' else {expected!r}\n"
+                "print(repr((value,)))\n",
+            )
+            helper.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(Path(__file__).parents[1] / "client" / "tag"), expected],
+                env={**os.environ, "XDG_CURRENT_DESKTOP": "KDE", "G_DEBUG": "fatal-criticals",
+                     "PATH": directory + os.pathsep + os.defpath},
+                capture_output=True, text=True, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_one_http_session_and_closed_downloads_preserve_file_order(self):
         from unittest.mock import MagicMock

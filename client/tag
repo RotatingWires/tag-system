@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
-from contextlib import closing, contextmanager, nullcontext
+import ast
+from contextlib import closing
 import getpass
 import mimetypes
 import os
@@ -14,10 +15,11 @@ import time
 from urllib.parse import quote
 
 BASE_URL = "http://server-ip-port-here"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 KEYRING_SERVICE = "tag-system"
 KEYRING_ACCOUNT = BASE_URL
 CLIPBOARD_SETTLE_SECONDS = 0.5
+CLIPBOARD_HISTORY_QUERY_SECONDS = 0.1
 IMAGE_CLIPBOARD_HOLD_MS = 2000
 IMAGE_CLIPBOARD_START_TIMEOUT_SECONDS = 5
 
@@ -238,49 +240,51 @@ def copy_to_clipboard(data, mime_type="text/plain;charset=utf-8", filename=""):
         raise SystemExit(f"Could not copy tag contents to the clipboard: {exc}") from exc
 
 
-@contextmanager
-def clipboard_history_connection():
+def read_history_reply(command, timeout):
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+        # Both methods return a GVariant tuple containing exactly one string.
+        # This subset uses Python-compatible string/tuple escaping.
+        reply = ast.literal_eval(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError, SyntaxError, ValueError):
+        return None
+    if isinstance(reply, tuple) and len(reply) == 1 and isinstance(reply[0], str):
+        return reply[0]
+    return None
+
+
+def clipboard_history_command():
     if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").upper().split(":"):
-        yield None
-        return
-    try:
-        from PySide6.QtCore import QCoreApplication
-        from PySide6.QtDBus import QDBusConnection
-    except ImportError:
-        yield None
-        return
-    app = QCoreApplication.instance()
-    owns_app = app is None
-    if owns_app:
-        app = QCoreApplication(["tag"])
-    try:
-        bus = QDBusConnection.sessionBus()
-        yield bus if bus.isConnected() else None
-    finally:
-        # Destroy our Qt application while Python/GLib are still running,
-        # including on failed copies. quit() alone does not destroy it.
-        if owns_app:
-            app.shutdown()
+        return None
+    helper = shutil.which("gdbus")
+    if helper is None:
+        return None
+    owner = read_history_reply([
+        helper, "call", "--session", "--dest", "org.freedesktop.DBus",
+        "--object-path", "/org/freedesktop/DBus",
+        "--method", "org.freedesktop.DBus.GetNameOwner", "org.kde.klipper",
+    ], CLIPBOARD_HISTORY_QUERY_SECONDS)
+    if owner is None or not owner.startswith(":"):
+        return None
+    # A unique owner address cannot activate an absent/restarting Klipper.
+    return [helper, "call", "--session", "--dest", owner, "--object-path", "/klipper",
+            "--method", "org.kde.klipper.klipper.getClipboardContents"]
 
 
-def wait_for_clipboard_history(data, mime_type, connection):
+def wait_for_clipboard_history(data, mime_type, command):
     deadline = time.monotonic() + CLIPBOARD_SETTLE_SECONDS
-    if connection is not None and mime_type.startswith("text/plain"):
-        from PySide6.QtDBus import QDBus, QDBusMessage
-
-        message = QDBusMessage.createMethodCall(
-            "org.kde.klipper", "/klipper", "org.kde.klipper.klipper", "getClipboardContents",
-        )
-        message.setAutoStartService(False)
+    if command is not None and mime_type.startswith("text/plain"):
         expected = data.decode("utf-8") if isinstance(data, bytes) else data
         while time.monotonic() < deadline:
-            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
-            reply = connection.call(message, QDBus.CallMode.Block, min(50, remaining_ms))
-            if reply.type() == QDBusMessage.MessageType.ErrorMessage:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            reply = read_history_reply(command, min(CLIPBOARD_HISTORY_QUERY_SECONDS, remaining))
+            if reply is None:
                 break
             # Klipper returns its newest history entry, not the live selection.
             # Matching the full text means it is safe to publish the next item.
-            if reply.type() == QDBusMessage.MessageType.ReplyMessage and reply.arguments() == [expected]:
+            if reply == expected:
                 return
             time.sleep(min(0.01, max(0, deadline - time.monotonic())))
     remaining = deadline - time.monotonic()
@@ -341,13 +345,12 @@ def get(args):
     if text_entries:
         clipboard_items.insert(0, ("\n".join(text_entries), "text/plain;charset=utf-8", ""))
 
-    history = clipboard_history_connection() if len(clipboard_items) > 1 else nullcontext(None)
-    with history as connection:
-        for index, (data, mime_type, filename) in enumerate(clipboard_items):
-            if index:
-                previous_data, previous_type, _ = clipboard_items[index - 1]
-                wait_for_clipboard_history(previous_data, previous_type, connection)
-            copy_to_clipboard(data, mime_type, filename)
+    history_command = clipboard_history_command() if len(clipboard_items) > 1 else None
+    for index, (data, mime_type, filename) in enumerate(clipboard_items):
+        if index:
+            previous_data, previous_type, _ = clipboard_items[index - 1]
+            wait_for_clipboard_history(previous_data, previous_type, history_command)
+        copy_to_clipboard(data, mime_type, filename)
     count = len(clipboard_items)
     print(f"Copied {count} {'item' if count == 1 else 'items'} to clipboard")
     if count > 1:

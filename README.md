@@ -1,7 +1,7 @@
 > [!WARNING]
 > This project is fully vibecoded, probably inefficient, but it does what I wanted lol
 
-# Tag System v1.0.2
+# Tag System v1.0.3
 
 A small self-hosted tagging service for saving **text, URLs, and files** under simple tag names and retrieving them from a command-line client. It is designed for a personal LAN/VPN workflow: a FastAPI server runs on one machine (for example a Windows NAS), while the `tag` client runs on Linux or another computer and talks to that server over HTTP.
 
@@ -256,7 +256,7 @@ Retrieve **all entries** in the tag and combine saved text and URL entries into 
 
 Files are downloaded into a new `tag-*` temporary directory for each retrieval, so later retrievals do not overwrite files referenced by earlier history entries. Temporary-file retention follows your operating system's cleanup policy. Names containing spaces, `#`, or other URL-special characters are encoded in download requests.
 
-Text and file-URI copies use `wl-copy` on Wayland or `xclip` on X11. On KDE, before replacing a text item, `tag get` checks Klipper's newest history entry and moves on as soon as the full text matches. That avoids the fixed half-second pause when Klipper captures it quickly. If Klipper cannot confirm the text, or the preceding item is an image/file URI, the normal half-second capture window remains. This check only reads history and does not start Klipper or modify its settings. Its Qt application is explicitly shut down before the command finishes, including on errors, rather than leaving Qt/GLib cleanup to interpreter exit.
+Text and file-URI copies use `wl-copy` on Wayland or `xclip` on X11. On KDE, before replacing a text item, `tag get` checks Klipper's newest history entry and moves on as soon as the full text matches. That avoids the fixed half-second pause when Klipper captures it quickly. The optional check uses the desktop's `gdbus` executable in a separate process; it does not initialize Qt alongside the keyring in the main CLI process. Qt remains confined to the image provider. If `gdbus` is unavailable, Klipper cannot confirm the text, or the preceding item is an image/file URI, the normal half-second capture window remains. Queries have short timeouts, only read history, and target Klipper's existing D-Bus owner so they cannot start it or modify its settings.
 
 Image copies run a separate Qt clipboard provider that stays in its event loop for two seconds, matching Spectacle's transfer lifetime. That transfer window runs in the background: `tag get` waits only until the provider publishes the image, then finishes without waiting for its two-second lifetime. Image workers skip HTTP/keyring imports; those libraries load only in commands that use them. All downloads in one `tag get` reuse one HTTP session, allowing connection reuse rather than making a new connection for each file. Startup/download errors still stop the command instead of reporting a successful copy. Downloads and any necessary capture wait still take time.
 
