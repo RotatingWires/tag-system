@@ -6,6 +6,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 import zlib
@@ -16,6 +17,7 @@ client = runpy.run_path(str(Path(__file__).parents[1] / "client" / "tag"))
 get = client["get"]
 copy_to_clipboard = client["copy_to_clipboard"]
 serve_clipboard_image = client["serve_clipboard_image"]
+start_image_clipboard = client["start_image_clipboard"]
 
 
 def png_chunk(kind, data):
@@ -53,14 +55,77 @@ class ClipboardTests(unittest.TestCase):
     def test_images_use_qt_worker_on_wayland_and_x11(self):
         for environment in [{"WAYLAND_DISPLAY": "wayland-0"}, {}]:
             with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True), \
-                    patch("shutil.which") as which, patch("subprocess.run") as run:
+                    patch("shutil.which") as which, \
+                    patch.dict(copy_to_clipboard.__globals__, start_image_clipboard=Mock()) as globals_:
                 copy_to_clipboard(PNG, "image/png", "screenshot.png")
-                command = run.call_args.args[0]
+                start = globals_["start_image_clipboard"]
+                command, payload = start.call_args.args
                 self.assertEqual(command[:2], [sys.executable, "-c"])
                 self.assertIn("serve_clipboard_image", command[2])
                 self.assertEqual(command[-2:], ["image/png", "screenshot.png"])
-                self.assertEqual(run.call_args.kwargs, {"input": PNG, "check": True})
+                self.assertEqual(payload, PNG)
                 which.assert_not_called()
+
+    def test_image_copy_returns_after_ready_while_provider_stays_alive(self):
+        command = [sys.executable, "-c",
+                   "import sys,time; data=sys.stdin.buffer.read(); "
+                   "assert data; print('ready',flush=True); time.sleep(10)"]
+        popen = subprocess.Popen
+        providers = []
+
+        def launch(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            providers.append(process)
+            return process
+
+        try:
+            with patch("subprocess.Popen", side_effect=launch) as create:
+                start = time.monotonic()
+                start_image_clipboard(command, PNG)
+                self.assertLess(time.monotonic() - start, 2)
+            create.assert_called_once()
+            self.assertTrue(create.call_args.kwargs["start_new_session"])
+            self.assertIsNone(providers[0].poll())
+            self.assertTrue(providers[0].stdin.closed)
+            self.assertTrue(providers[0].stdout.closed)
+        finally:
+            for process in providers:
+                process.terminate()
+                process.wait(timeout=2)
+
+    def test_provider_failure_reports_original_error_and_reaps_process(self):
+        command = [sys.executable, "-c",
+                   "import sys; sys.stdin.buffer.read(); sys.exit('image could not be decoded')"]
+        popen = subprocess.Popen
+        with patch("subprocess.Popen", side_effect=popen) as create:
+            with self.assertRaisesRegex(OSError, "image could not be decoded"):
+                start_image_clipboard(command, PNG)
+
+    def test_unresponsive_provider_is_stopped_instead_of_reporting_success(self):
+        command = [sys.executable, "-c", "import sys,time; sys.stdin.buffer.read(); time.sleep(10)"]
+        popen = subprocess.Popen
+        providers = []
+
+        def launch(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            providers.append(process)
+            return process
+
+        with patch("subprocess.Popen", side_effect=launch), \
+                patch.dict(start_image_clipboard.__globals__, IMAGE_CLIPBOARD_START_TIMEOUT_SECONDS=0.1):
+            with self.assertRaisesRegex(OSError, "did not become ready"):
+                start_image_clipboard(command, PNG)
+        self.assertIsNotNone(providers[0].returncode)
+
+    def test_version_does_not_contact_server_or_keyring(self):
+        with patch("requests.get") as request, patch("keyring.get_password") as key, \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(SystemExit) as exit_:
+                client["parser"].parse_args(["--version"])
+        self.assertEqual(exit_.exception.code, 0)
+        self.assertEqual(output.getvalue(), f"Tag System {client['VERSION']}\n")
+        request.assert_not_called()
+        key.assert_not_called()
 
     def test_qt_image_offer_matches_spectacle_image_and_kde_metadata(self):
         app = Mock()
@@ -76,7 +141,12 @@ class ClipboardTests(unittest.TestCase):
         self.assertTrue(mime.hasFormat("x-kde-force-image-copy"))
         self.assertEqual(bytes(mime.data("application/x-kde-suggestedfilename")), "screenshot-雪.png".encode())
         create_app.assert_called_once_with(["tag", "-platform", "xcb"])
-        timer.assert_called_once_with(client["IMAGE_CLIPBOARD_HOLD_MS"], app.quit)
+        self.assertEqual(timer.call_count, 2)
+        self.assertEqual(timer.call_args_list[0].args[0], 0)
+        with patch("builtins.print") as output:
+            timer.call_args_list[0].args[1]()
+        output.assert_called_once_with("ready", flush=True)
+        timer.assert_any_call(client["IMAGE_CLIPBOARD_HOLD_MS"], app.quit)
         app.exec.assert_called_once()
 
     def test_invalid_image_is_rejected_before_opening_a_clipboard_connection(self):
@@ -155,17 +225,16 @@ class ClipboardTests(unittest.TestCase):
                 patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
                 patch("requests.get", side_effect=[tag, download]) as request, \
-                patch("shutil.which", return_value="/usr/bin/wl-copy"), \
-                patch("subprocess.run", side_effect=lambda *a, **kw: events.append(
-                    (a[0][-2] if a[0][0] == sys.executable else a[0][-1], kw["input"]))) as run, \
+                patch.dict(get.__globals__, copy_to_clipboard=Mock(side_effect=lambda data, mime, filename:
+                    events.append((mime, data, filename)))) as globals_, \
                 patch("time.sleep", side_effect=lambda _: events.append("settle")), \
                 patch("subprocess.Popen") as open_file, patch("builtins.print") as output:
             get(SimpleNamespace(name="he-on-dnd-screenshot", open_files=False))
             self.assertEqual(events, [
-                ("text/plain;charset=utf-8", b"https://example.com/one\nhttps://example.com/two"), "settle",
-                ("image/png", image),
+                ("text/plain;charset=utf-8", "https://example.com/one\nhttps://example.com/two", ""), "settle",
+                ("image/png", image, "screenshot #1.png"),
             ])
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(globals_["copy_to_clipboard"].call_count, 2)
             self.assertTrue(request.call_args.args[0].endswith("/he-on-dnd-screenshot/screenshot%20%231.png"))
             self.assertEqual(Path(folder, "screenshot #1.png").read_bytes(), image)
             open_file.assert_not_called()
@@ -194,11 +263,13 @@ class ClipboardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
                 patch("requests.get", side_effect=[tag, Mock(raw=io.BytesIO(PNG)), Mock(raw=io.BytesIO(PNG))]), \
-                patch("subprocess.run") as run, patch("time.sleep") as sleep, patch("builtins.print"):
+                patch.dict(get.__globals__, copy_to_clipboard=Mock()) as globals_, \
+                patch("time.sleep") as sleep, patch("builtins.print"):
             get(SimpleNamespace(name="images-only", open_files=False))
-            self.assertEqual(run.call_count, 2)
-            self.assertEqual([c.args[0][-1] for c in run.call_args_list], ["first.png", "second.png"])
-            self.assertTrue(all(c.kwargs["input"] == PNG for c in run.call_args_list))
+            copies = globals_["copy_to_clipboard"].call_args_list
+            self.assertEqual(len(copies), 2)
+            self.assertEqual([c.args[2] for c in copies], ["first.png", "second.png"])
+            self.assertTrue(all(c.args[0] == PNG for c in copies))
             sleep.assert_called_once_with(client["CLIPBOARD_SETTLE_SECONDS"])
 
     def test_clipboard_failure_stops_without_reporting_all_entries_copied(self):
@@ -211,12 +282,12 @@ class ClipboardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
                 patch("requests.get", side_effect=[tag, download]), \
-                patch("shutil.which", return_value="/usr/bin/xclip"), patch("time.sleep"), \
-                patch("subprocess.run", side_effect=[None, subprocess.CalledProcessError(1, "xclip")]) as run, \
+                patch("time.sleep"), \
+                patch.dict(get.__globals__, copy_to_clipboard=Mock(side_effect=[None, SystemExit("Could not copy image")])) as globals_, \
                 patch("builtins.print") as output:
             with self.assertRaisesRegex(SystemExit, "Could not copy"):
                 get(SimpleNamespace(name="test", open_files=False))
-            self.assertEqual(run.call_count, 2)
+            self.assertEqual(globals_["copy_to_clipboard"].call_count, 2)
             output.assert_not_called()
 
     def test_empty_and_missing_tags_leave_clipboard_unchanged(self):
