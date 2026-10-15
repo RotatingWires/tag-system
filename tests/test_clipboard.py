@@ -18,6 +18,7 @@ get = client["get"]
 copy_to_clipboard = client["copy_to_clipboard"]
 serve_clipboard_image = client["serve_clipboard_image"]
 start_image_clipboard = client["start_image_clipboard"]
+wait_for_clipboard_history = client["wait_for_clipboard_history"]
 
 
 def png_chunk(kind, data):
@@ -118,7 +119,7 @@ class ClipboardTests(unittest.TestCase):
         self.assertIsNotNone(providers[0].returncode)
 
     def test_version_does_not_contact_server_or_keyring(self):
-        with patch("requests.get") as request, patch("keyring.get_password") as key, \
+        with patch("requests.Session.get") as request, patch("keyring.get_password") as key, \
                 patch("sys.stdout", new_callable=io.StringIO) as output:
             with self.assertRaises(SystemExit) as exit_:
                 client["parser"].parse_args(["--version"])
@@ -174,6 +175,92 @@ class ClipboardTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "Could not copy tag contents"):
                 copy_to_clipboard("one\ntwo")
 
+    def test_klipper_confirmation_skips_the_fixed_text_wait(self):
+        from PySide6.QtDBus import QDBusMessage
+
+        bus = Mock()
+        bus.call.return_value = Mock(
+            type=lambda: QDBusMessage.MessageType.ReplyMessage,
+            arguments=lambda: ["  first\nhttps://example.com\n雪  "],
+        )
+        with patch("time.sleep") as sleep:
+            wait_for_clipboard_history("  first\nhttps://example.com\n雪  ", "text/plain;charset=utf-8", (Mock(), bus))
+        sleep.assert_not_called()
+        message = bus.call.call_args.args[0]
+        self.assertEqual(message.service(), "org.kde.klipper")
+        self.assertEqual(message.path(), "/klipper")
+        self.assertEqual(message.member(), "getClipboardContents")
+        self.assertFalse(message.autoStartService())
+
+    def test_klipper_waits_for_exact_text_instead_of_any_history_change(self):
+        from PySide6.QtDBus import QDBusMessage
+
+        bus = Mock()
+        bus.call.side_effect = [
+            Mock(type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["older text"]),
+            Mock(type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["both URLs\n雪"]),
+        ]
+        with patch("time.sleep") as sleep:
+            wait_for_clipboard_history("both URLs\n雪", "text/plain;charset=utf-8", (Mock(), bus))
+        self.assertEqual(bus.call.call_count, 2)
+        sleep.assert_called_once()
+        self.assertLessEqual(sleep.call_args.args[0], 0.01)
+
+    def test_unavailable_klipper_preserves_the_remaining_capture_window(self):
+        from PySide6.QtDBus import QDBusMessage
+
+        bus = Mock()
+        bus.call.return_value = Mock(type=lambda: QDBusMessage.MessageType.ErrorMessage)
+        with patch("time.monotonic", side_effect=[0, 0, 0, 0.05]), patch("time.sleep") as sleep:
+            wait_for_clipboard_history("hello", "text/plain;charset=utf-8", (Mock(), bus))
+        sleep.assert_called_once_with(0.45)
+
+    def test_klipper_does_not_shortcut_waiting_for_images_or_file_uris(self):
+        for mime in ["image/png", "text/uri-list"]:
+            with self.subTest(mime=mime), patch("time.monotonic", return_value=0), patch("time.sleep") as sleep:
+                bus = Mock()
+                wait_for_clipboard_history(PNG, mime, (Mock(), bus))
+                bus.call.assert_not_called()
+                sleep.assert_called_once_with(client["CLIPBOARD_SETTLE_SECONDS"])
+
+    def test_stale_klipper_history_cannot_exceed_capture_window(self):
+        from PySide6.QtDBus import QDBusMessage
+
+        bus = Mock()
+        bus.call.return_value = Mock(
+            type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["old"],
+        )
+        with patch("time.monotonic", side_effect=[0, 0, 0, 0.1, 0.6, 0.6]), patch("time.sleep") as sleep:
+            wait_for_clipboard_history("new", "text/plain;charset=utf-8", (Mock(), bus))
+        bus.call.assert_called_once()
+        sleep.assert_called_once_with(0.01)
+
+    def test_one_http_session_and_closed_downloads_preserve_file_order(self):
+        from unittest.mock import MagicMock
+
+        session = MagicMock()
+        session.__enter__.return_value = session
+        tag = Mock(status_code=200)
+        tag.json.return_value = {"items": [
+            {"type": "file", "filename": "one.txt"}, {"type": "file", "filename": "two.txt"},
+        ]}
+        downloads = [Mock(raw=io.BytesIO(b"first")), Mock(raw=io.BytesIO(b"second"))]
+        session.get.side_effect = [tag, *downloads]
+        copy = Mock()
+        with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
+                patch("keyring.get_password", return_value="test-key"), \
+                patch("requests.Session", return_value=session) as create, \
+                patch.dict(get.__globals__, copy_to_clipboard=copy), patch("time.sleep"), patch("builtins.print"):
+            get(SimpleNamespace(name="files", open_files=False))
+        create.assert_called_once_with()
+        session.__exit__.assert_called_once()
+        for response in downloads:
+            response.close.assert_called_once_with()
+        self.assertEqual([call.args[0] for call in copy.call_args_list], ["first", "second"])
+        self.assertEqual(session.get.call_count, 3)
+        for call in session.get.call_args_list:
+            self.assertEqual(call.kwargs["headers"], {"x-api-key": "test-key"})
+
     def test_get_combines_saved_text_and_urls_but_keeps_files_separate(self):
         items = [
             {"type": "text", "content": "  first"},
@@ -190,7 +277,7 @@ class ClipboardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, \
                 patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
-                patch("requests.get", side_effect=[tag, text_file, binary_file]) as request, \
+                patch("requests.Session.get", side_effect=[tag, text_file, binary_file]) as request, \
                 patch("shutil.which", return_value="/usr/bin/xclip"), \
                 patch("subprocess.run") as run, patch("time.sleep") as sleep, \
                 patch("subprocess.Popen") as open_file, \
@@ -202,7 +289,7 @@ class ClipboardTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[2].args[0][-1], "text/uri-list")
             self.assertEqual(sleep.call_count, len(expected) - 1)
             for call in sleep.call_args_list:
-                self.assertEqual(call.args, (client["CLIPBOARD_SETTLE_SECONDS"],))
+                self.assertAlmostEqual(call.args[0], client["CLIPBOARD_SETTLE_SECONDS"], places=3)
             self.assertEqual(open_file.call_count, 2)
             self.assertEqual(request.call_count, 3)
             for call in request.call_args_list:
@@ -224,7 +311,7 @@ class ClipboardTests(unittest.TestCase):
                 patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}), \
                 patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
-                patch("requests.get", side_effect=[tag, download]) as request, \
+                patch("requests.Session.get", side_effect=[tag, download]) as request, \
                 patch.dict(get.__globals__, copy_to_clipboard=Mock(side_effect=lambda data, mime, filename:
                     events.append((mime, data, filename)))) as globals_, \
                 patch("time.sleep", side_effect=lambda _: events.append("settle")), \
@@ -246,7 +333,7 @@ class ClipboardTests(unittest.TestCase):
             {"type": "text", "content": "  first"}, {"type": "url", "content": "https://example.com"},
             {"type": "text", "content": "last  "},
         ]}
-        with patch("keyring.get_password", return_value="test-key"), patch("requests.get", return_value=tag), \
+        with patch("keyring.get_password", return_value="test-key"), patch("requests.Session.get", return_value=tag), \
                 patch("shutil.which", return_value="/usr/bin/xclip"), \
                 patch("subprocess.run") as run, patch("time.sleep") as sleep, patch("builtins.print") as output:
             get(SimpleNamespace(name="text-only", open_files=False))
@@ -262,7 +349,7 @@ class ClipboardTests(unittest.TestCase):
         ]}
         with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
-                patch("requests.get", side_effect=[tag, Mock(raw=io.BytesIO(PNG)), Mock(raw=io.BytesIO(PNG))]), \
+                patch("requests.Session.get", side_effect=[tag, Mock(raw=io.BytesIO(PNG)), Mock(raw=io.BytesIO(PNG))]), \
                 patch.dict(get.__globals__, copy_to_clipboard=Mock()) as globals_, \
                 patch("time.sleep") as sleep, patch("builtins.print"):
             get(SimpleNamespace(name="images-only", open_files=False))
@@ -270,7 +357,8 @@ class ClipboardTests(unittest.TestCase):
             self.assertEqual(len(copies), 2)
             self.assertEqual([c.args[2] for c in copies], ["first.png", "second.png"])
             self.assertTrue(all(c.args[0] == PNG for c in copies))
-            sleep.assert_called_once_with(client["CLIPBOARD_SETTLE_SECONDS"])
+            sleep.assert_called_once()
+            self.assertAlmostEqual(sleep.call_args.args[0], client["CLIPBOARD_SETTLE_SECONDS"], places=3)
 
     def test_clipboard_failure_stops_without_reporting_all_entries_copied(self):
         tag = Mock(status_code=200)
@@ -281,7 +369,7 @@ class ClipboardTests(unittest.TestCase):
         download = Mock(raw=io.BytesIO(PNG))
         with tempfile.TemporaryDirectory() as folder, patch("tempfile.mkdtemp", return_value=folder), \
                 patch("keyring.get_password", return_value="test-key"), \
-                patch("requests.get", side_effect=[tag, download]), \
+                patch("requests.Session.get", side_effect=[tag, download]), \
                 patch("time.sleep"), \
                 patch.dict(get.__globals__, copy_to_clipboard=Mock(side_effect=[None, SystemExit("Could not copy image")])) as globals_, \
                 patch("builtins.print") as output:
@@ -294,7 +382,7 @@ class ClipboardTests(unittest.TestCase):
         for status, data in [(200, {"items": []}), (404, {"detail": "Tag not found"})]:
             with self.subTest(status=status), \
                     patch("keyring.get_password", return_value="test-key"), \
-                    patch("requests.get", return_value=SimpleNamespace(status_code=status, json=lambda: data)), \
+                    patch("requests.Session.get", return_value=SimpleNamespace(status_code=status, json=lambda: data)), \
                     patch("subprocess.run") as run, patch("builtins.print"):
                 get(SimpleNamespace(name="missing", open_files=False))
                 run.assert_not_called()
@@ -307,7 +395,7 @@ class ClipboardTests(unittest.TestCase):
         download = Mock()
         download.raise_for_status.side_effect = RuntimeError("Download failed")
         with patch("keyring.get_password", return_value="test-key"), \
-                patch("requests.get", side_effect=[tag, download]), patch("subprocess.run") as run:
+                patch("requests.Session.get", side_effect=[tag, download]), patch("subprocess.run") as run:
             with self.assertRaisesRegex(RuntimeError, "Download failed"):
                 get(SimpleNamespace(name="mixed", open_files=False))
         run.assert_not_called()
