@@ -19,6 +19,7 @@ copy_to_clipboard = client["copy_to_clipboard"]
 serve_clipboard_image = client["serve_clipboard_image"]
 start_image_clipboard = client["start_image_clipboard"]
 wait_for_clipboard_history = client["wait_for_clipboard_history"]
+clipboard_history_connection = client["clipboard_history_connection"]
 
 
 def png_chunk(kind, data):
@@ -184,13 +185,84 @@ class ClipboardTests(unittest.TestCase):
             arguments=lambda: ["  first\nhttps://example.com\n雪  "],
         )
         with patch("time.sleep") as sleep:
-            wait_for_clipboard_history("  first\nhttps://example.com\n雪  ", "text/plain;charset=utf-8", (Mock(), bus))
+            wait_for_clipboard_history("  first\nhttps://example.com\n雪  ", "text/plain;charset=utf-8", bus)
         sleep.assert_not_called()
         message = bus.call.call_args.args[0]
         self.assertEqual(message.service(), "org.kde.klipper")
         self.assertEqual(message.path(), "/klipper")
         self.assertEqual(message.member(), "getClipboardContents")
         self.assertFalse(message.autoStartService())
+
+    def test_owned_qt_application_is_destroyed_after_success_and_failure(self):
+        for connected, fail in [(True, False), (False, False), (True, True)]:
+            with self.subTest(connected=connected, fail=fail):
+                app = Mock()
+                bus = Mock(isConnected=lambda: connected)
+                with patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"), \
+                        patch("PySide6.QtCore.QCoreApplication") as application, \
+                        patch("PySide6.QtDBus.QDBusConnection.sessionBus", return_value=bus):
+                    application.instance.return_value = None
+                    application.return_value = app
+                    try:
+                        with clipboard_history_connection() as connection:
+                            self.assertIs(connection, bus if connected else None)
+                            app.shutdown.assert_not_called()
+                            if fail:
+                                raise OSError("Copy failed")
+                    except OSError:
+                        self.assertTrue(fail)
+                    app.shutdown.assert_called_once_with()
+
+    def test_existing_qt_application_belongs_to_its_caller(self):
+        app = Mock()
+        bus = Mock(isConnected=lambda: True)
+        with patch.dict(os.environ, XDG_CURRENT_DESKTOP="KDE"), \
+                patch("PySide6.QtCore.QCoreApplication") as application, \
+                patch("PySide6.QtDBus.QDBusConnection.sessionBus", return_value=bus):
+            application.instance.return_value = app
+            with clipboard_history_connection() as connection:
+                self.assertIs(connection, bus)
+            application.assert_not_called()
+            app.shutdown.assert_not_called()
+
+    def test_non_kde_capture_does_not_create_a_qt_application(self):
+        with patch("PySide6.QtCore.QCoreApplication") as application:
+            with clipboard_history_connection() as connection:
+                self.assertIsNone(connection)
+            application.assert_not_called()
+
+    def test_real_qt_probe_cleans_up_before_python_exit_with_glib_initialized(self):
+        from ctypes.util import find_library
+
+        glib = find_library("glib-2.0")
+        if glib is None:
+            self.skipTest("GLib is unavailable on this platform")
+        code = """
+import ctypes, runpy, sys
+from PySide6.QtCore import QCoreApplication
+glib = ctypes.CDLL(sys.argv[2])
+glib.g_main_context_default.restype = ctypes.c_void_p
+glib.g_main_context_push_thread_default.argtypes = [ctypes.c_void_p]
+glib.g_main_context_pop_thread_default.argtypes = [ctypes.c_void_p]
+context = glib.g_main_context_default()
+glib.g_main_context_push_thread_default(context)
+probe = runpy.run_path(sys.argv[1])['clipboard_history_connection']
+try:
+    for _ in range(3):
+        with probe():
+            assert QCoreApplication.instance() is not None
+        assert QCoreApplication.instance() is None
+finally:
+    glib.g_main_context_pop_thread_default(context)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(Path(__file__).parents[1] / "client" / "tag"), glib],
+            env={**os.environ, "XDG_CURRENT_DESKTOP": "KDE", "G_DEBUG": "fatal-criticals"},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("GLib-CRITICAL", result.stderr)
+        self.assertNotIn("g_main_context_pop_thread_default", result.stderr)
 
     def test_klipper_waits_for_exact_text_instead_of_any_history_change(self):
         from PySide6.QtDBus import QDBusMessage
@@ -201,7 +273,7 @@ class ClipboardTests(unittest.TestCase):
             Mock(type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["both URLs\n雪"]),
         ]
         with patch("time.sleep") as sleep:
-            wait_for_clipboard_history("both URLs\n雪", "text/plain;charset=utf-8", (Mock(), bus))
+            wait_for_clipboard_history("both URLs\n雪", "text/plain;charset=utf-8", bus)
         self.assertEqual(bus.call.call_count, 2)
         sleep.assert_called_once()
         self.assertLessEqual(sleep.call_args.args[0], 0.01)
@@ -212,14 +284,14 @@ class ClipboardTests(unittest.TestCase):
         bus = Mock()
         bus.call.return_value = Mock(type=lambda: QDBusMessage.MessageType.ErrorMessage)
         with patch("time.monotonic", side_effect=[0, 0, 0, 0.05]), patch("time.sleep") as sleep:
-            wait_for_clipboard_history("hello", "text/plain;charset=utf-8", (Mock(), bus))
+            wait_for_clipboard_history("hello", "text/plain;charset=utf-8", bus)
         sleep.assert_called_once_with(0.45)
 
     def test_klipper_does_not_shortcut_waiting_for_images_or_file_uris(self):
         for mime in ["image/png", "text/uri-list"]:
             with self.subTest(mime=mime), patch("time.monotonic", return_value=0), patch("time.sleep") as sleep:
                 bus = Mock()
-                wait_for_clipboard_history(PNG, mime, (Mock(), bus))
+                wait_for_clipboard_history(PNG, mime, bus)
                 bus.call.assert_not_called()
                 sleep.assert_called_once_with(client["CLIPBOARD_SETTLE_SECONDS"])
 
@@ -231,7 +303,7 @@ class ClipboardTests(unittest.TestCase):
             type=lambda: QDBusMessage.MessageType.ReplyMessage, arguments=lambda: ["old"],
         )
         with patch("time.monotonic", side_effect=[0, 0, 0, 0.1, 0.6, 0.6]), patch("time.sleep") as sleep:
-            wait_for_clipboard_history("new", "text/plain;charset=utf-8", (Mock(), bus))
+            wait_for_clipboard_history("new", "text/plain;charset=utf-8", bus)
         bus.call.assert_called_once()
         sleep.assert_called_once_with(0.01)
 
