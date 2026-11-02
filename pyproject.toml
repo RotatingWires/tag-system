@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tag-system"
+dynamic = ["version"]
+description = "Save text, URLs, and files under tag names and retrieve them from a command-line client."
+readme = "README.md"
+requires-python = ">=3.9"
+# One install provides both the server (FastAPI/Uvicorn) and the client (requests/keyring/PySide6).
+dependencies = ["fastapi", "uvicorn", "python-multipart", "requests", "keyring", "PySide6"]
+
+[project.scripts]
+tag = "tagsystem.client:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "tagsystem.client.VERSION"}
+
+[tool.setuptools.packages.find]
+include = ["tagsystem*"]

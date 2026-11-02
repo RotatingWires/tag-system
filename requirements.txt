@@ -1,6 +1,0 @@
-fastapi
-keyring
-python-multipart
-requests
-PySide6
-uvicorn

@@ -1,12 +1,16 @@
+from collections import OrderedDict
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Request
 from fastapi.responses import FileResponse
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
+import threading
+import time
 
 from runtime_logging import configure_runtime_logging
 
@@ -20,6 +24,12 @@ os.makedirs(TMP_DIR, exist_ok=True)
 
 DB_FILE = os.path.join(BASE_DIR, "tags.json")
 API_KEY_HASH_FILE = os.path.join(BASE_DIR, "api-key.sha256")
+
+AUTH_FAILURE_LIMIT = 5
+AUTH_FAILURE_WINDOW_SECONDS = 60
+MAX_TRACKED_ADDRESSES = 1024
+auth_failures = OrderedDict()  # client address -> (window start, failed attempts)
+auth_failures_lock = threading.Lock()
 
 def load_db():
     if os.path.exists(DB_FILE):
@@ -78,20 +88,41 @@ def load_or_create_api_key_hash():
 API_KEY_HASH = load_or_create_api_key_hash()
 migrate_legacy_file_paths()
 
-def auth(x_api_key):
-    supplied_hash = hash_api_key(x_api_key)
-    if not hmac.compare_digest(supplied_hash, API_KEY_HASH):
-        raise HTTPException(status_code=403)
+def auth(request, x_api_key):
+    address = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with auth_failures_lock:
+        start, failures = auth_failures.get(address, (now, 0))
+        if now - start >= AUTH_FAILURE_WINDOW_SECONDS:
+            start, failures = now, 0
+            auth_failures.pop(address, None)
+        # Once locked out, reject every request (even the right key) so the
+        # response cannot reveal whether a guess was correct.
+        if failures >= AUTH_FAILURE_LIMIT:
+            retry = max(1, math.ceil(AUTH_FAILURE_WINDOW_SECONDS - (now - start)))
+            raise HTTPException(429, detail="Too many failed API key attempts. Try again later.",
+                                headers={"Retry-After": str(retry)})
+
+    if hmac.compare_digest(hash_api_key(x_api_key), API_KEY_HASH):
+        return
+
+    with auth_failures_lock:
+        auth_failures.pop(address, None)
+        auth_failures[address] = (start, failures + 1)
+        while len(auth_failures) > MAX_TRACKED_ADDRESSES:
+            auth_failures.popitem(last=False)
+    raise HTTPException(status_code=403)
 
 @app.post("/tags/{tag_name}/add")
 async def add_tag(
     tag_name: str,
+    request: Request,
     text: Optional[List[str]] = Form(None),
     url: Optional[List[str]] = Form(None),
     file: Optional[List[UploadFile]] = File(None),
     x_api_key: str = Header(...),
 ):
-    auth(x_api_key)
+    auth(request, x_api_key)
     db = load_db()
     if tag_name not in db:
         db[tag_name] = []
@@ -117,22 +148,22 @@ async def add_tag(
     return {"status": "saved", "items": db[tag_name]}
 
 @app.get("/tags")
-def list_tags(x_api_key: str = Header(...)):
-    auth(x_api_key)
+def list_tags(request: Request, x_api_key: str = Header(...)):
+    auth(request, x_api_key)
     db = load_db()
     return list(db.keys())
 
 @app.get("/tags/{tag_name}")
-def get_tag(tag_name: str, x_api_key: str = Header(...)):
-    auth(x_api_key)
+def get_tag(tag_name: str, request: Request, x_api_key: str = Header(...)):
+    auth(request, x_api_key)
     db = load_db()
     if tag_name not in db:
         raise HTTPException(404, detail="Tag not found")
     return {"items": db[tag_name]}
 
 @app.delete("/tags/{tag_name}")
-def delete_tag(tag_name: str, x_api_key: str = Header(...)):
-    auth(x_api_key)
+def delete_tag(tag_name: str, request: Request, x_api_key: str = Header(...)):
+    auth(request, x_api_key)
     db = load_db()
     if tag_name not in db:
         raise HTTPException(404, detail="Tag not found")
@@ -148,14 +179,14 @@ def delete_tag(tag_name: str, x_api_key: str = Header(...)):
     return {"status": "deleted"}
 
 @app.get("/tags/search/{query}")
-def search_tags(query: str, x_api_key: str = Header(...)):
-    auth(x_api_key)
+def search_tags(query: str, request: Request, x_api_key: str = Header(...)):
+    auth(request, x_api_key)
     db = load_db()
     return [k for k in db.keys() if query.lower() in k.lower()]
 
 @app.get("/download/{tag_name}/{filename}")
-def download_file(tag_name: str, filename: str, x_api_key: str = Header(...)):
-    auth(x_api_key)
+def download_file(tag_name: str, filename: str, request: Request, x_api_key: str = Header(...)):
+    auth(request, x_api_key)
     db = load_db()
     if tag_name not in db:
         raise HTTPException(404, detail="Tag not found")

@@ -1,7 +1,6 @@
 import io
 import os
 from pathlib import Path
-import runpy
 import subprocess
 import struct
 import sys
@@ -13,7 +12,9 @@ import zlib
 from unittest.mock import Mock, patch
 
 
-client = runpy.run_path(str(Path(__file__).parents[1] / "client" / "tag"))
+import tagsystem.client
+
+client = vars(tagsystem.client)
 get = client["get"]
 copy_to_clipboard = client["copy_to_clipboard"]
 serve_clipboard_image = client["serve_clipboard_image"]
@@ -37,6 +38,9 @@ class ClipboardTests(unittest.TestCase):
         self.environ = patch.dict(os.environ, {}, clear=True)
         self.environ.start()
         self.addCleanup(self.environ.stop)
+        self.server = patch.dict(client, server_url=lambda: "http://tag.test")
+        self.server.start()
+        self.addCleanup(self.server.stop)
 
     def test_wayland_prefers_native_clipboard_even_with_xwayland(self):
         with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}), \
@@ -269,16 +273,16 @@ class ClipboardTests(unittest.TestCase):
 
     def test_fast_history_probe_runs_without_loading_qt_into_cli(self):
         code = """
-import importlib.abc, runpy, sys
+import importlib.abc, sys
 class BlockQt(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname == 'PySide6' or fullname.startswith('PySide6.'):
             raise AssertionError('Qt must stay out of the CLI history probe')
 sys.meta_path.insert(0, BlockQt())
-client = runpy.run_path(sys.argv[1])
-command = client['clipboard_history_command']()
+import tagsystem.client as client
+command = client.clipboard_history_command()
 assert command is not None
-client['wait_for_clipboard_history'](sys.argv[2], 'text/plain;charset=utf-8', command)
+client.wait_for_clipboard_history(sys.argv[1], 'text/plain;charset=utf-8', command)
 assert not any(name.startswith('PySide6') for name in sys.modules)
 """
         expected = "two URLs\nquotes: '\" and 雪"
@@ -291,7 +295,7 @@ assert not any(name.startswith('PySide6') for name in sys.modules)
             )
             helper.chmod(0o755)
             result = subprocess.run(
-                [sys.executable, "-c", code, str(Path(__file__).parents[1] / "client" / "tag"), expected],
+                [sys.executable, "-c", code, expected], cwd=Path(__file__).parents[1],
                 env={**os.environ, "XDG_CURRENT_DESKTOP": "KDE", "G_DEBUG": "fatal-criticals",
                      "PATH": directory + os.pathsep + os.defpath},
                 capture_output=True, text=True, timeout=10,

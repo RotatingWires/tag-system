@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
+"""Tag System command-line client, installed as the `tag` command."""
+
 import argparse
 import ast
 from contextlib import closing
 import getpass
+import json
 import mimetypes
 import os
 from pathlib import Path
@@ -12,24 +14,55 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
-BASE_URL = "http://server-ip-port-here"
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 KEYRING_SERVICE = "tag-system"
-KEYRING_ACCOUNT = BASE_URL
 CLIPBOARD_SETTLE_SECONDS = 0.5
 CLIPBOARD_HISTORY_QUERY_SECONDS = 0.1
 IMAGE_CLIPBOARD_HOLD_MS = 2000
 IMAGE_CLIPBOARD_START_TIMEOUT_SECONDS = 5
 
 
-def get_api_key():
+def config_path():
+    if os.name == "nt":
+        root = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    else:
+        root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return root / "tag-system" / "config.json"
+
+
+def saved_server_url():
+    try:
+        return json.loads(config_path().read_text(encoding="utf-8"))["server_url"]
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"Could not read {config_path()}: {exc}. Run: tag configure")
+
+
+def server_url():
+    url = saved_server_url()
+    if not url:
+        raise SystemExit("No server configured. Run: tag configure")
+    return url
+
+
+def normalize_server_url(url):
+    url = url.strip().rstrip("/")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
+        raise SystemExit("Enter the server address as http://HOST:PORT, for example http://192.168.1.50:8710")
+    return url
+
+
+def get_api_key(url):
     import keyring
     from keyring.errors import KeyringError
 
+    # The keyring entry is keyed by server URL, so each server keeps its own key.
     try:
-        api_key = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        api_key = keyring.get_password(KEYRING_SERVICE, url)
     except KeyringError as exc:
         raise SystemExit(f"Could not read API key from system keyring: {exc}")
 
@@ -39,30 +72,38 @@ def get_api_key():
     return api_key
 
 
-def headers():
-    return {"x-api-key": get_api_key()}
+def headers(url):
+    return {"x-api-key": get_api_key(url)}
 
 
 def configure(args):
     import keyring
     from keyring.errors import KeyringError
 
-    api_key = getpass.getpass("API key: ").strip()
-    if not api_key:
-        print("API key was not changed")
-        return
+    current = saved_server_url()
+    prompt = f"Server URL [{current}]: " if current else "Server URL (http://HOST:PORT): "
+    url = normalize_server_url(input(prompt).strip() or current)
+    api_key = getpass.getpass("API key (leave empty to keep the saved key): ").strip()
 
     try:
-        keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, api_key)
+        if api_key:
+            keyring.set_password(KEYRING_SERVICE, url, api_key)
+        elif not keyring.get_password(KEYRING_SERVICE, url):
+            raise SystemExit(f"No API key is saved for {url}; run tag configure again and enter it.")
     except KeyringError as exc:
-        raise SystemExit(f"Could not save API key to system keyring: {exc}")
+        raise SystemExit(f"Could not access the system keyring: {exc}")
 
-    print("API key saved to system keyring")
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"server_url": url}) + "\n", encoding="utf-8")
+    print(f"Server set to {url}")
+    print("API key saved to system keyring" if api_key else "Kept the saved API key")
 
 
 def add(args):
     import requests
 
+    base_url = server_url()
     data = []
     files = []
     opened_files = []
@@ -85,10 +126,10 @@ def add(args):
             files.append(("file", (os.path.basename(path), handle)))
 
         res = requests.post(
-            f"{BASE_URL}/tags/{args.name}/add",
+            f"{base_url}/tags/{args.name}/add",
             data=data,
             files=files,
-            headers=headers(),
+            headers=headers(base_url),
         )
         res.raise_for_status()
         print("Saved")
@@ -100,7 +141,8 @@ def add(args):
 def show(args):
     import requests
 
-    res = requests.get(f"{BASE_URL}/tags/{args.name}", headers=headers())
+    base_url = server_url()
+    res = requests.get(f"{base_url}/tags/{args.name}", headers=headers(base_url))
     if res.status_code != 200:
         print(res.json().get("detail"))
         return
@@ -119,8 +161,9 @@ def show(args):
 def show_all(args):
     import requests
 
-    auth_headers = headers()
-    res = requests.get(f"{BASE_URL}/tags", headers=auth_headers)
+    base_url = server_url()
+    auth_headers = headers(base_url)
+    res = requests.get(f"{base_url}/tags", headers=auth_headers)
     tags = res.json()
 
     if not tags:
@@ -129,7 +172,7 @@ def show_all(args):
 
     for name in tags:
         print(f"\n=== {name} ===")
-        res = requests.get(f"{BASE_URL}/tags/{name}", headers=auth_headers)
+        res = requests.get(f"{base_url}/tags/{name}", headers=auth_headers)
         if res.status_code != 200:
             print("Error:", res.json().get("detail"))
             continue
@@ -152,7 +195,7 @@ def serve_clipboard_image(data, mime_type, filename):
         from PySide6.QtCore import QMimeData, QTimer
         from PySide6.QtGui import QClipboard, QGuiApplication, QImage
     except ImportError:
-        raise SystemExit("Image copying requires PySide6. Install the client dependencies from requirements.txt.")
+        raise SystemExit("Image copying requires PySide6. Reinstall Tag System with: python -m pip install .")
 
     image = QImage.fromData(data)
     if image.isNull():
@@ -216,9 +259,9 @@ def copy_to_clipboard(data, mime_type="text/plain;charset=utf-8", filename=""):
     if mime_type.startswith("image/"):
         command = [
             sys.executable, "-c",
-            "import runpy,sys; runpy.run_path(sys.argv[1])['serve_clipboard_image']"
-            "(sys.stdin.buffer.read(),sys.argv[2],sys.argv[3])",
-            os.path.abspath(__file__), mime_type, filename,
+            "import sys; from tagsystem.client import serve_clipboard_image; "
+            "serve_clipboard_image(sys.stdin.buffer.read(),sys.argv[1],sys.argv[2])",
+            mime_type, filename,
         ]
     elif os.environ.get("WAYLAND_DISPLAY"):
         command = ["wl-copy", "--type", mime_type]
@@ -295,10 +338,11 @@ def wait_for_clipboard_history(data, mime_type, command):
 def get(args):
     import requests
 
-    auth_headers = headers()
+    base_url = server_url()
+    auth_headers = headers(base_url)
     with requests.Session() as session:
         tag_name = quote(args.name, safe="")
-        res = session.get(f"{BASE_URL}/tags/{tag_name}", headers=auth_headers)
+        res = session.get(f"{base_url}/tags/{tag_name}", headers=auth_headers)
         if res.status_code != 200:
             print(res.json().get("detail"))
             return
@@ -319,7 +363,7 @@ def get(args):
                 if download_dir is None:
                     download_dir = tempfile.mkdtemp(prefix="tag-")
                 tmp_path = Path(download_dir) / os.path.basename(filename)
-                file_url = f"{BASE_URL}/download/{tag_name}/{quote(filename, safe='')}"
+                file_url = f"{base_url}/download/{tag_name}/{quote(filename, safe='')}"
                 with closing(session.get(file_url, headers=auth_headers, stream=True)) as r:
                     r.raise_for_status()
 
@@ -360,7 +404,8 @@ def get(args):
 def list_tags(args):
     import requests
 
-    res = requests.get(f"{BASE_URL}/tags", headers=headers())
+    base_url = server_url()
+    res = requests.get(f"{base_url}/tags", headers=headers(base_url))
     res.raise_for_status()
     for tag_name in res.json():
         print(tag_name)
@@ -369,7 +414,8 @@ def list_tags(args):
 def delete(args):
     import requests
 
-    res = requests.delete(f"{BASE_URL}/tags/{args.name}", headers=headers())
+    base_url = server_url()
+    res = requests.delete(f"{base_url}/tags/{args.name}", headers=headers(base_url))
     if res.status_code == 404:
         print("Tag not found")
     else:
@@ -380,7 +426,8 @@ def delete(args):
 def search(args):
     import requests
 
-    res = requests.get(f"{BASE_URL}/tags/search/{args.query}", headers=headers())
+    base_url = server_url()
+    res = requests.get(f"{base_url}/tags/search/{args.query}", headers=headers(base_url))
     res.raise_for_status()
     for tag_name in res.json():
         print(tag_name)
@@ -392,7 +439,7 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--version", action="version", version=f"Tag System {VERSION}")
 sub = parser.add_subparsers(dest="command")
 
-p = sub.add_parser("configure", help="Save or replace the API key in the system keyring")
+p = sub.add_parser("configure", help="Set the server URL and save its API key in the system keyring")
 p.set_defaults(func=configure)
 
 p = sub.add_parser("add", help="Add one or more items to a tag")
@@ -425,9 +472,15 @@ p = sub.add_parser("search", help="Search tag names")
 p.add_argument("query")
 p.set_defaults(func=search)
 
-if __name__ == "__main__":
+
+
+def main():
     args = parser.parse_args()
     if hasattr(args, "func"):
         args.func(args)
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
