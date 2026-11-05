@@ -46,7 +46,7 @@ Upgrading from v1.0.x: run `python -m pip install .` again, then `tag configure`
 
 Back up `tags.json` and `tag-cache/` together from `BASE_DIR`. Include `api-key.sha256` to keep the same client key after a restore. Use only one server instance per data directory.
 
-## Security
+## Security and privacy
 
 This is a lightweight personal tool, not a hardened internet-facing service.
 

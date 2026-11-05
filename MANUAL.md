@@ -347,7 +347,7 @@ Back up `tags.json` and `tag-cache/` together. `tags.json` contains tag metadata
 
 Because the database is a JSON file rather than a transactional database, avoid running multiple independent server instances against the same `BASE_DIR` at the same time.
 
-## Security
+## Security and privacy
 
 This is a lightweight personal tool, not a hardened internet-facing service.
 
