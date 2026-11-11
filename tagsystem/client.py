@@ -16,7 +16,7 @@ import tempfile
 import time
 from urllib.parse import quote, urlsplit
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 KEYRING_SERVICE = "tag-system"
 CLIPBOARD_SETTLE_SECONDS = 0.5
 CLIPBOARD_HISTORY_QUERY_SECONDS = 0.1

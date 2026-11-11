@@ -1,7 +1,7 @@
 > [!WARNING]
 > This project is fully vibecoded, probably inefficient, but it does what I wanted lol
 
-# Tag System v1.1.0
+# Tag System v1.1.1
 
 A small self-hosted service for saving text, URLs, and files under tag names and retrieving them through a command-line client, including clipboard copies and file downloads.
 

@@ -16,7 +16,8 @@ from runtime_logging import configure_runtime_logging
 
 configure_runtime_logging()
 
-app = FastAPI()
+# No /docs, /redoc, or /openapi.json: FastAPI serves those without the API key.
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 BASE_DIR = r"C:\path\to\folder\with\this\file"
 TMP_DIR = os.path.join(BASE_DIR, "tag-cache")

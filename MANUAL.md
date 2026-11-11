@@ -1,7 +1,7 @@
 > [!WARNING]
 > This project is fully vibecoded, probably inefficient, but it does what I wanted lol
 
-# Tag System v1.1.0
+# Tag System v1.1.1
 
 A small self-hosted tagging service for saving **text, URLs, and files** under simple tag names and retrieving them from a command-line client. It is designed for a personal LAN/VPN workflow: a FastAPI server runs on one machine (for example a Windows NAS), while the `tag` client runs on Linux or another computer and talks to that server over HTTP.
 
@@ -359,6 +359,7 @@ This is a lightweight personal tool, not a hardened internet-facing service.
 - Plain HTTP still exposes the API key and payloads to someone capable of sniffing the network path. This project assumes a trusted LAN/VPN unless HTTPS is added separately.
 - Restrict the firewall so port `8710` is not publicly reachable unless that is intentional.
 - File downloads are authorized with the same API key as other requests.
+- FastAPI's built-in `/docs`, `/redoc`, and `/openapi.json` pages are turned off, because FastAPI serves them without the API key. [HTTP endpoints](#http-endpoints) lists the API instead.
 - `tags.json` and `tag-cache/` may contain private material; back them up appropriately.
 - The server does not enable CORS because the provided client is a CLI and does not need browser cross-origin access.
 - Only run this service for users/devices you trust.
